@@ -1,0 +1,31 @@
+Customer: Hi, how do I start a return for one of my orders? It's the wrong size.
+
+Agent: Sorry about that. Can I get the order number?
+
+Customer: Yeah, it's ORD-40188.
+
+Agent: Thanks, I've started a return on that order.
+
+Customer: Actually, on second thought, could we do an exchange instead? I'd rather just size up.
+
+Agent: No problem, I've switched it over to an exchange for a larger size.
+
+Customer: Great, appreciate that.
+
+Agent: Anything else I can help with?
+
+Customer: Actually yes, I also need an invoice for that same order for my expense report.
+
+Agent: Sure thing, can you confirm the order number again?
+
+Customer: Same one, ORD-40188.
+
+Agent: Got it, I'll have that invoice emailed over within the hour.
+
+Customer: Awesome, thank you.
+
+Agent: You're welcome, anything else?
+
+Customer: No that covers everything, bye!
+
+Agent: Take care, bye now.

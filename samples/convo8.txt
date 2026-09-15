@@ -1,0 +1,75 @@
+Customer: Hi, I've got a few things going on with my account and I'm honestly getting pretty frustrated.
+
+Agent: I'm sorry to hear that, let's get everything sorted. What's going on first?
+
+Customer: I was charged twice for the same order, ORD-88712.
+
+Agent: Let me check... yes, I can confirm there are two charges on that order, that shouldn't have happened.
+
+Customer: Yeah, I noticed it on my statement two days ago and I've been meaning to call.
+
+Agent: I'm submitting a refund request for the duplicate charge right now.
+
+Customer: Thank you. Also, I have a completely different order I want to cancel, ORD-29650.
+
+Agent: Let me check the status of that one... it hasn't shipped yet, so I've gone ahead and cancelled it, you'll see the refund in 3 to 5 business days.
+
+Customer: Perfect. And actually, hold on, I also need to reschedule delivery on a third order.
+
+Agent: No problem, what's the order number and the new date you'd like?
+
+Customer: That one is ORD-34509, could you move it to next Friday?
+
+Agent: Sure, I've rescheduled ORD-34509 for delivery next Friday.
+
+Customer: Great, actually wait, scratch that, can we do next Tuesday instead? I won't be home Friday.
+
+Agent: No problem at all, I've updated it to next Tuesday.
+
+Customer: Thank you, sorry for going back and forth.
+
+Agent: Not a problem at all, happens all the time. Anything else?
+
+Customer: Yeah, actually, going back to that duplicate charge, how long will the refund take?
+
+Agent: For that one, refunds usually post within 5 to 7 business days.
+
+Customer: Okay. Honestly this whole thing has been a headache, first the double charge and now I'm worried the cancellation didn't actually go through either.
+
+Agent: I completely understand the frustration, let me double check... yes, it's confirmed cancelled on our end.
+
+Customer: Alright, I also want to cancel my order and check on a refund for a different one at the same time, can you handle both?
+
+Agent: I can help with both, but let's take them one at a time so I don't mix anything up. Which order first?
+
+Customer: Fine, the refund status on ORD-93475 first, I mentioned it earlier this year.
+
+Agent: I don't see an order under that number on this account, could you double check the number?
+
+Customer: Sorry, my mistake, it's ORD-91027.
+
+Agent: Thanks, checking now... that refund was completed last week.
+
+Customer: Okay, and then the other order I wanted to cancel is ORD-29650, wait, no, I already cancelled that one, never mind.
+
+Agent: That's right, that one's already cancelled, no action needed there.
+
+Customer: Honestly, between the double charge and all this back and forth, I'm pretty unhappy with how this whole thing has gone.
+
+Agent: I completely understand, and I apologize for the trouble today.
+
+Customer: I'd like to file a formal complaint about this whole experience.
+
+Agent: Of course, I'll log a formal complaint on your account right now.
+
+Customer: I also want to speak to a supervisor or a real person about it, not that I don't appreciate your help.
+
+Agent: That's completely fair, let me transfer you to a senior agent now.
+
+Customer: Thank you, I appreciate you staying patient with me through all this.
+
+Agent: Not a problem at all, please hold for a moment while the transfer goes through.
+
+Customer: Will do, thanks again.
+
+Agent: Thank you for your patience, connecting you now.

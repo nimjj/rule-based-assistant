@@ -1,0 +1,427 @@
+/* Live-demo stylesheet. Light, high-contrast, readable at projector
+   distance. No framework, no external fonts. */
+
+* { box-sizing: border-box; }
+
+:root {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --ink: #1a1d21;
+  --ink-soft: #5b6470;
+  --line: #d9dde2;
+  --accent: #2f6feb;
+  --good: #1f9d55;
+  --good-bg: #e6f6ec;
+  --wait: #b7791f;
+  --wait-bg: #fdf3e2;
+  --fire: #7c3aed;
+  --fire-bg: #f1e9fd;
+  --miss: #8a94a0;
+  --code-bg: #eef0f3;
+}
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+body { display: flex; flex-direction: column; }
+
+code {
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 0.9em;
+}
+
+/* -- header -- */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: #1a1d21;
+  color: #fff;
+}
+header h1 { font-size: 18px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
+.header-meta { display: flex; align-items: center; gap: 14px; font-size: 14px; color: #c7ccd4; }
+.header-meta code { background: #2c3138; color: #e7eaef; }
+.header-btn {
+  background: #2c3138;
+  color: #fff;
+  border: 1px solid #3a4048;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.header-btn:hover { background: #363c44; }
+.header-btn:disabled { opacity: 0.5; cursor: default; }
+#stop-playback { background: #6b2020; border-color: #7a2a2a; }
+#stop-playback:hover { background: #7a2626; }
+
+/* -- layout -- */
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(340px, 1fr) minmax(440px, 1.3fr);
+  gap: 16px;
+  padding: 16px 20px;
+  min-height: 0;
+}
+.left { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+
+/* Three panels, one grid track each, sized by fr so they always divide up
+   whatever height .right actually has -- not a guess at viewport size.
+   minmax(_, Nfr) both gives each a floor (so none vanishes) and lets all
+   three shrink together (instead of one panel being squeezed to 0 while
+   the others sit at full content height) when content grows or the window
+   gets short. Panel 2 (slot extraction) gets the largest share since it's
+   the one meant to carry the most turns at once. */
+.right {
+  display: grid;
+  grid-template-rows: minmax(150px, 0.9fr) minmax(170px, 1.3fr) minmax(170px, 1.1fr);
+  gap: 12px;
+  min-height: 0;
+}
+
+/* -- transcript -- */
+#transcript {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.turn {
+  display: grid;
+  grid-template-columns: 28px 62px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: #fbfcfd;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.turn:hover { border-color: #b9c1cc; }
+.turn.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,0.15); }
+.turn.turn-agent { background: #f7f8fb; }
+.turn-num { color: var(--ink-soft); font-size: 13px; text-align: center; }
+.turn-speaker { color: var(--ink-soft); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+.turn-agent .turn-speaker { color: var(--accent); }
+.turn-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.turn-tag {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #eef0f3;
+  color: var(--ink-soft);
+}
+.tag-accepted { background: var(--good-bg); color: var(--good); }
+.tag-slot_fill { background: #e7eefc; color: var(--accent); }
+.tag-escalated, .tag-multi_intent { background: var(--fire-bg); color: var(--fire); }
+.tag-unknown { background: #f0f1f3; color: var(--miss); }
+.tag-correction { background: var(--wait-bg); color: var(--wait); }
+.tag-duplicate { background: #f0f1f3; color: var(--miss); }
+.tag-override { background: var(--good-bg); color: var(--good); }
+
+/* -- flash / errors -- */
+#flash {
+  background: #fdecec;
+  border: 1px solid #f3b9b9;
+  color: #a12626;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 14px;
+}
+
+/* -- composer -- */
+.composer { display: flex; align-items: center; gap: 8px; }
+#utterance {
+  flex: 1;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
+  background: var(--panel);
+}
+#utterance:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47,111,235,0.15); }
+#send {
+  padding: 12px 18px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+#send:disabled { opacity: 0.5; cursor: default; }
+#spinner { color: var(--ink-soft); font-size: 13px; }
+
+/* -- panels -- */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* respect the grid row height instead of forcing it to grow */
+}
+.panel-head {
+  padding: 10px 14px;
+  font-weight: 600;
+  font-size: 14px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfcfd;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.panel-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+}
+.panel-body { flex: 1; min-height: 0; padding: 14px; overflow-y: auto; }
+.placeholder { color: var(--miss); font-style: italic; }
+
+/* -- intent panel -- */
+.headline { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.badge {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: #eef0f3;
+  color: var(--ink-soft);
+  font-weight: 700;
+}
+.badge-accepted { background: var(--good-bg); color: var(--good); }
+.badge-slot_fill { background: #e7eefc; color: var(--accent); }
+.badge-escalated, .badge-multi_intent { background: var(--fire-bg); color: var(--fire); }
+.badge-unknown { background: #f0f1f3; color: var(--miss); }
+.badge-correction, .badge-continuation { background: var(--wait-bg); color: var(--wait); }
+.badge-duplicate { background: #f0f1f3; color: var(--miss); }
+.badge-override { background: var(--good-bg); color: var(--good); }
+.sel-intent { font-size: 20px; font-weight: 700; }
+.sub { color: var(--ink-soft); font-size: 13px; margin-bottom: 10px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.chip {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--wait-bg);
+  color: var(--wait);
+  border: 1px solid #f0dcb8;
+}
+
+.cands { display: flex; flex-direction: column; gap: 6px; }
+.cand { display: grid; grid-template-columns: 1fr 120px 52px; align-items: center; gap: 10px; font-size: 14px; }
+.cand-name { font-family: "SF Mono", Consolas, monospace; font-size: 13px; }
+.cand-bar { background: #eef0f3; border-radius: 999px; height: 8px; overflow: hidden; }
+.cand-bar > span { display: block; height: 100%; background: var(--accent); }
+.cand:first-child .cand-bar > span { background: var(--good); }
+.cand-score { text-align: right; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+
+.esc {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--fire-bg);
+  border: 1px solid #ddc9f7;
+  border-radius: 8px;
+}
+.esc-head { font-weight: 600; color: var(--fire); font-size: 13px; }
+.esc-reason { font-family: Consolas, monospace; font-size: 12px; color: var(--ink-soft); margin: 3px 0; }
+.esc-note { font-size: 13px; }
+
+.blocked-msg {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--fire-bg);
+  border: 1px solid #ddc9f7;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+/* -- slots panel -- */
+.frame {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--miss);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.frame:last-child { margin-bottom: 0; }
+.frame-AWAITING_INFO { border-left-color: var(--wait); }
+.frame-FIRED { border-left-color: var(--fire); }
+.frame-OPEN { border-left-color: var(--accent); }
+.frame-REVERTED { border-left-color: var(--miss); opacity: 0.65; }
+.frame-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.frame-id { color: var(--ink-soft); font-size: 12px; }
+.frame-intent { font-weight: 700; font-family: "SF Mono", Consolas, monospace; font-size: 14px; }
+.frame-status {
+  margin-left: auto;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef0f3;
+  color: var(--ink-soft);
+}
+.frame-FIRED .frame-status { background: var(--fire-bg); color: var(--fire); }
+.frame-AWAITING_INFO .frame-status { background: var(--wait-bg); color: var(--wait); }
+.frame-origin { font-size: 11px; color: var(--accent); font-style: italic; }
+
+.slot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  font-size: 14px;
+  margin-top: 5px;
+}
+.slot-name { font-family: "SF Mono", Consolas, monospace; font-size: 13px; min-width: 110px; }
+.slot-val { flex: 1; }
+.slot-filled { background: var(--good-bg); }
+.slot-filled .slot-val { color: var(--good); font-weight: 600; }
+.slot-missing { background: #f6f7f8; }
+.slot-missing .slot-val { color: var(--miss); font-style: italic; }
+.slot-none { background: #f6f7f8; color: var(--ink-soft); font-style: italic; }
+.slot-new { box-shadow: 0 0 0 2px rgba(31,157,85,0.4); }
+.slot-edit-btn {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.slot-edit-btn:hover { background: rgba(0,0,0,0.06); border-color: var(--line); color: var(--ink); }
+.slot-editing { background: #fbfcfd; box-shadow: 0 0 0 2px rgba(47,111,235,0.2); }
+.slot-edit-input {
+  flex: 1;
+  padding: 5px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font: inherit;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 13px;
+  background: var(--panel);
+}
+.slot-edit-input:focus { outline: none; box-shadow: 0 0 0 3px rgba(47,111,235,0.15); }
+.slot-btn {
+  flex: 0 0 auto;
+  padding: 5px 10px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.slot-btn-ghost { background: transparent; color: var(--ink-soft); border: 1px solid var(--line); }
+.slot-flag {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--good);
+  font-weight: 700;
+}
+
+/* -- mcp panel -- */
+.mcp-idle { color: var(--ink-soft); font-style: italic; }
+.mcp-call {
+  border: 1px solid #ddc9f7;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+.mcp-call:last-of-type { margin-bottom: 0; }
+.mcp-call-head {
+  background: var(--fire);
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  padding: 8px 12px;
+}
+.mcp-call pre {
+  margin: 0;
+  padding: 12px;
+  background: #faf7ff;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 13px;
+  overflow-x: auto;
+}
+.mcp-result { border-top: 1px solid #ddc9f7; }
+.mcp-result-head {
+  background: var(--good);
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  padding: 8px 12px;
+}
+.mcp-result pre {
+  margin: 0;
+  padding: 12px;
+  background: var(--good-bg);
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 13px;
+  overflow-x: auto;
+}
+.mcp-history-head {
+  margin-top: 14px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ink-soft);
+}
+.mcp-hist {
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 12px;
+  color: var(--ink-soft);
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  /* Stacked layout: .right no longer shares a fixed-height row with .left,
+     so the fr-based grid has nothing meaningful to divide -- fall back to
+     natural-height panels (page scrolls as a whole), each capped so one
+     panel with a lot of content still can't push the others off-screen. */
+  .right { display: flex; flex-direction: column; }
+  .right .panel { max-height: 60vh; }
+}

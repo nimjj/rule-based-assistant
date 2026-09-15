@@ -1,0 +1,79 @@
+Customer: Hi, I've been trying to check out for like twenty minutes and it just keeps freezing on me.
+
+Agent: I'm sorry about that, let me note it down so we can flag it to the tech team.
+
+Customer: I also can't get my discount code to apply, it's FALL15.
+
+Agent: Let me check that code for you... it looks valid on our end, so it should be applying.
+
+Customer: It's just not working, same with the freezing, honestly this whole site feels broken today.
+
+Agent: I'm really sorry for the trouble, let's try to work through each piece. Does the page freeze before or after you enter the code?
+
+Customer: After, right when I click apply.
+
+Agent: Okay, that's useful, I'll pass that detail along too.
+
+Customer: While we're waiting on that, can I ask something else? Is the Ember Throw Blanket machine washable?
+
+Agent: Let me check... yes, it's machine washable on a cold, gentle cycle.
+
+Customer: Perfect, good to know. Okay, let's get back to the checkout issue.
+
+Agent: Sure, can you try refreshing the page and re-entering the code?
+
+Customer: Okay, trying that now... it went through that time, but now my card's getting declined.
+
+Agent: Sorry about that, is it possible the card has a temporary hold or the billing address doesn't match?
+
+Customer: Maybe, it's the same card I always use though.
+
+Agent: Sometimes that happens with our fraud check on larger orders, I'd try a different card or contact your bank just in case.
+
+Customer: Ugh, fine, let me try my other card... okay, that one went through.
+
+Agent: Great, glad that worked. Sorry again for all the trouble today.
+
+Customer: It's fine, honestly, if the discount code hadn't worked either I was just going to cancel the whole order.
+
+Agent: I completely understand, I'm glad we got it sorted in the end.
+
+Customer: Actually, now that I think about it, do you have a loyalty program? I order from you guys a lot.
+
+Agent: We do, you earn points on every purchase that you can redeem for discounts later.
+
+Customer: Oh nice, how do I sign up for that?
+
+Agent: It's automatic once you create an account, so you're actually already enrolled.
+
+Customer: Oh, I didn't know that, that's good to know.
+
+Agent: Anything else I can help with today?
+
+Customer: Actually yeah, going back to the checkout freezing earlier, is that a known issue on your end?
+
+Agent: It's been reported a few times today, so yes, we're aware and the team is looking into it.
+
+Customer: Okay, that's a bit frustrating, this is the second time this month it's happened to me.
+
+Agent: I completely understand the frustration, I'm sorry it's happened more than once.
+
+Customer: Honestly, between the freezing and the card issue, this has been a pretty rough shopping experience.
+
+Agent: I hear you, and I want to make sure that's documented properly.
+
+Customer: I'd like to file a complaint about the recurring technical issues.
+
+Agent: Absolutely, I'm logging a formal complaint on your account right now with all the details from today.
+
+Customer: Thank you. Could I also talk to someone on the technical team directly, or at least a human agent about it?
+
+Agent: I can transfer you to an agent who handles these escalations, one moment please.
+
+Customer: Sure, take your time.
+
+Agent: Thanks for your patience, I'm connecting you now.
+
+Customer: Appreciate it, thanks for the help today.
+
+Agent: Of course, take care.

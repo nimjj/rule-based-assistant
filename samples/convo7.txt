@@ -1,0 +1,31 @@
+Customer: Hi, I received the wrong item in my recent order.
+
+Agent: Oh no, I'm sorry about that. Let me pull up your account, can I get the order number?
+
+Customer: Sure, it's 63920, no dash or anything, just the numbers.
+
+Agent: Found it. I've logged the wrong-item report and we'll get the correct one shipped out today.
+
+Customer: Thank you, I appreciate that.
+
+Agent: Of course, is there anything else I can help with?
+
+Customer: Actually yeah, while I've got you, I'm following up on a refund from a different order that still hasn't shown up.
+
+Agent: No problem, what's the order number for that one?
+
+Customer: That one was ORD-71344.
+
+Agent: Let me check... I can see it was processed on our end four days ago, it can take a few more business days to actually post to your bank.
+
+Customer: Okay, that's good to know, I was starting to worry.
+
+Agent: Totally understandable, is there anything else today?
+
+Customer: Actually, one more thing, is the Solstice Rug back in stock? I wanted to reorder it.
+
+Agent: Let me check... yes, it's back in stock as of this week.
+
+Customer: Perfect, that's everything then, thanks for your help.
+
+Agent: You're welcome, take care.

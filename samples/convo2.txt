@@ -1,0 +1,21 @@
+Customer: Hi, I want to return an item from my order.
+
+Agent: Sure, what's the order number?
+
+Customer: ORD-77210.
+
+Agent: Got it, I've started the return. Would you like a refund or an exchange?
+
+Customer: Actually, I'd rather exchange it for a different size instead.
+
+Agent: No problem, I've switched that to an exchange. Anything else?
+
+Customer: Yeah, my discount code isn't working, it's SAVE20.
+
+Agent: Let me check that... it looks like it expired last week.
+
+Customer: Ah okay, is there a promotion running I could use instead?
+
+Agent: Yes, we currently have 15% off with WELCOME15.
+
+Customer: Great, thanks.

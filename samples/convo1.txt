@@ -1,0 +1,17 @@
+Customer: Hi, I wanted to check on my order.
+
+Agent: Sure, can I get your order number?
+
+Customer: It's ORD-48213.
+
+Agent: Thanks, that's on track for delivery Thursday. Anything else?
+
+Customer: Actually yes, while I've got you can you tell me if the Aurora Desk Lamp is back in stock?
+
+Agent: Let me check... yes, it's back in stock.
+
+Customer: Great. Also I think I was charged twice on a different order, ORD-50876.
+
+Agent: I can see a duplicate charge on that one, I'll submit a refund request.
+
+Customer: Perfect, thanks.

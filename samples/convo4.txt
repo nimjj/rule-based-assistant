@@ -1,0 +1,15 @@
+Customer: Hi, quick question about an order I placed last week.
+
+Agent: Sure, happy to help. What's the order number?
+
+Customer: It's ORD-55201.
+
+Agent: Let me check... looks like it shipped yesterday and is on track to arrive tomorrow.
+
+Customer: Perfect, that's all I needed to know.
+
+Agent: Great, anything else today?
+
+Customer: No, that's it. Thanks!
+
+Agent: You're welcome, have a good one.

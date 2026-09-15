@@ -1,0 +1,9 @@
+sentence-transformers>=5.0
+numpy
+pandas
+openpyxl
+dateparser
+ollama
+fastapi
+uvicorn
+python-dotenv

@@ -1,0 +1,15 @@
+Customer: Hey, does your store sell digital gift cards?
+
+Agent: We do, you can buy them right from the gift cards page on our site.
+
+Customer: Oh nice. Do they expire at some point?
+
+Agent: No, ours never expire, so there's no rush to use it.
+
+Customer: Perfect, that's exactly what I wanted to know.
+
+Agent: Glad I could help, anything else?
+
+Customer: Nope, that's all. Thanks so much!
+
+Agent: You're welcome, take care.
