@@ -1,0 +1,27 @@
+Customer: Hi, I got the wrong item in my order.
+
+Agent: I'm sorry about that, let me pull up your account. What's the order number?
+
+Customer: It's ORD-72104.
+
+Agent: I see it now - looks like a medium went out instead of the large you ordered. I've logged the wrong-item report on ORD-72104.
+
+Customer: Sure, I trust your judgment on the best way to handle it.
+
+Agent: I'll go ahead and exchange it for you then - ORD-72104 is set up to swap for the correct size, that'll ship out today.
+
+Customer: Perfect, thank you.
+
+Agent: While I'm in here, I noticed a second order on your account, ORD-65590. Let's just cancel it - I've gone ahead and cancelled ORD-65590 for you.
+
+Customer: Oh, I completely forgot about that one, yeah please cancel it, I don't need it anymore.
+
+Agent: That's confirmed and squared away, ORD-65590 is cancelled on our end - you'll see that reflected shortly.
+
+Customer: Thanks for catching that, I appreciate you looking out.
+
+Agent: Of course, anything else I can help with?
+
+Customer: No, that's everything, thanks again.
+
+Agent: You're welcome, take care!

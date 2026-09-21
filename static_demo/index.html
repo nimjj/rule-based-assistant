@@ -23,8 +23,12 @@
       <div id="transcript" aria-live="polite"></div>
       <div id="flash" hidden></div>
       <div class="composer">
+        <div class="speaker-toggle" role="group" aria-label="Speaker">
+          <button id="speaker-customer" type="button" class="speaker-btn active" data-speaker="Customer">Customer</button>
+          <button id="speaker-agent" type="button" class="speaker-btn" data-speaker="Agent">Agent</button>
+        </div>
         <input id="utterance" type="text" autocomplete="off" spellcheck="false"
-               placeholder='Type &quot;Customer: ...&quot; or &quot;Agent: ...&quot; and press Enter' />
+               placeholder="Type what they said and press Enter" />
         <button id="send" type="button">Send</button>
         <span id="spinner" hidden>thinking&hellip;</span>
       </div>

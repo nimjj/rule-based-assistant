@@ -122,7 +122,14 @@ main {
 .turn-num { color: var(--ink-soft); font-size: 13px; text-align: center; }
 .turn-speaker { color: var(--ink-soft); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
 .turn-agent .turn-speaker { color: var(--accent); }
-.turn-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.turn-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
 .turn-tag {
   font-size: 11px;
   text-transform: uppercase;
@@ -152,6 +159,25 @@ main {
 
 /* -- composer -- */
 .composer { display: flex; align-items: center; gap: 8px; }
+.speaker-toggle {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+.speaker-btn {
+  padding: 12px 14px;
+  border: none;
+  background: var(--panel);
+  color: var(--ink-soft);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.speaker-btn + .speaker-btn { border-left: 1px solid var(--line); }
+.speaker-btn:hover { background: #f0f1f3; }
+.speaker-btn.active { background: var(--accent); color: #fff; }
 #utterance {
   flex: 1;
   padding: 12px 14px;

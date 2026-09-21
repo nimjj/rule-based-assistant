@@ -5,7 +5,7 @@
 // is a dumb renderer for that shape, so no pipeline branching logic lives
 // here.
 
-const state = { callId: null, turns: [], selected: -1, playing: false };
+const state = { callId: null, turns: [], selected: -1, playing: false, speaker: "Customer" };
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -69,10 +69,20 @@ async function newCall() {
   }
 }
 
+function setSpeaker(speaker) {
+  state.speaker = speaker;
+  $("#speaker-customer").classList.toggle("active", speaker === "Customer");
+  $("#speaker-agent").classList.toggle("active", speaker === "Agent");
+}
+
 async function sendTurn() {
   const input = $("#utterance");
-  const text = input.value.trim();
-  if (!text || !state.callId) return;
+  const raw = input.value.trim();
+  if (!raw || !state.callId) return;
+  // Strip a manually-typed "Customer:"/"Agent:" prefix so it isn't doubled
+  // up with the tag the speaker toggle adds below.
+  const stripped = TURN_RE.exec(raw);
+  const text = `${state.speaker}: ${stripped ? stripped[2].trim() : raw}`;
   setBusy(true);
   try {
     const view = await api(`/demo/calls/${state.callId}/turns`, {
@@ -294,7 +304,7 @@ function renderTranscript() {
 
 function renderIntent(view) {
   const el = $("#panel-intent .panel-body");
-  if (!view) { el.innerHTML = placeholder('Type "Customer: ..." or "Agent: ..." to begin.'); return; }
+  if (!view) { el.innerHTML = placeholder("Pick a speaker and type a turn to begin."); return; }
   const it = view.intent;
 
   const cands = it.candidates.map((c) => {
@@ -436,6 +446,8 @@ function renderMcp(view) {
 
 window.addEventListener("DOMContentLoaded", () => {
   $("#send").onclick = sendTurn;
+  $("#speaker-customer").onclick = () => setSpeaker("Customer");
+  $("#speaker-agent").onclick = () => setSpeaker("Agent");
   $("#new-call").onclick = newCall;
   $("#stop-playback").onclick = stopPlayback;
   $("#upload-transcript").onclick = () => $("#transcript-file").click();

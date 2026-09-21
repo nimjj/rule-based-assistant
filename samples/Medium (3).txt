@@ -1,0 +1,27 @@
+Customer: Hi, I wanted to check on my order, it's taking longer than expected.
+
+Agent: Sorry to hear that - can I get the order number?
+
+Customer: It's ORD-58217.
+
+Agent: Let me check... it's still in transit, running about a day behind the original estimate.
+
+Customer: Okay, as long as it's still coming.
+
+Agent: While I have your account open, I can see you were also charged twice on order ORD-58217 - let me go ahead and submit a dispute for that duplicate charge.
+
+Customer: Oh wow, I hadn't even noticed that, thank you for catching it.
+
+Agent: Of course, that's taken care of on our end.
+
+Customer: I appreciate that.
+
+Agent: I'll also send you an invoice for order ORD-58217 - it'll have an itemized breakdown for your records.
+
+Customer: That would be great, thanks.
+
+Agent: Done, that should land in your inbox shortly. Anything else I can help with?
+
+Customer: No, that covers it, thanks so much for catching that extra charge.
+
+Agent: Anytime, take care!
