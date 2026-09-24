@@ -52,3 +52,6 @@ Thumbs.db
 
 *.md
 
+
+# Runtime logs contain raw customer utterances
+logs/*.jsonl
