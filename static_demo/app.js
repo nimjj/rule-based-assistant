@@ -1,6 +1,6 @@
 "use strict";
 
-// Live demo front-end. Talks only to the /demo/* routes in demo_web.py.
+// Live demo front-end. Talks only to the public /v1 API in server.py.
 // Each turn returns a stable 3-part "view" (intent / slots / mcp); this file
 // is a dumb renderer for that shape, so no pipeline branching logic lives
 // here.
@@ -26,7 +26,7 @@ async function api(path, opts) {
   });
   if (!res.ok) {
     let detail = res.status + " " + res.statusText;
-    try { detail = (await res.json()).detail || detail; } catch (e) { /* ignore */ }
+    try { detail = (await res.json()).error.message || detail; } catch (e) { /* ignore */ }
     throw new Error(detail);
   }
   return res.json();
@@ -49,7 +49,7 @@ function setBusy(busy) {
 // -- actions --------------------------------------------------------------
 
 async function createCall() {
-  const { call_id } = await api("/demo/calls", { method: "POST" });
+  const { call_id } = await api("/v1/calls", { method: "POST" });
   state.callId = call_id;
   state.turns = [];
   state.selected = -1;
@@ -79,23 +79,19 @@ async function sendTurn() {
   const input = $("#utterance");
   const raw = input.value.trim();
   if (!raw || !state.callId) return;
-  // Strip a manually-typed "Customer:"/"Agent:" prefix so it isn't doubled
-  // up with the tag the speaker toggle adds below.
+  // Strip a manually-typed "Customer:"/"Agent:" prefix; the speaker toggle
+  // decides who's talking.
   const stripped = TURN_RE.exec(raw);
-  const text = `${state.speaker}: ${stripped ? stripped[2].trim() : raw}`;
+  const text = stripped ? stripped[2].trim() : raw;
   setBusy(true);
   try {
-    const view = await api(`/demo/calls/${state.callId}/turns`, {
+    const view = await api(`/v1/calls/${state.callId}/turns`, {
       method: "POST",
-      body: JSON.stringify({ utterance: text }),
+      body: JSON.stringify({ utterance: text, speaker: state.speaker.toLowerCase() }),
     });
-    if (view.error) {
-      flash(view.error);
-    } else {
-      state.turns.push(view);
-      state.selected = state.turns.length - 1;
-      input.value = "";
-    }
+    state.turns.push(view);
+    state.selected = state.turns.length - 1;
+    input.value = "";
   } catch (err) {
     flash("Request failed: " + err.message);
   } finally {
@@ -109,7 +105,7 @@ async function sendTurn() {
 //
 // Inline edit on any slot row in panel 2: click the pencil, type the
 // corrected value, Save. Backed by demo_web.py's
-// POST /demo/calls/{id}/frames/{frame_id}/slots/{slot_name}, which re-runs
+// PATCH /v1/calls/{id}/frames/{frame_id}/slots/{slot_name}, which re-runs
 // the same extractor a normal turn would use and, once the frame's required
 // slots are all filled, rebuilds and redispatches its MCP tool call with the
 // corrected data. The response is a normal turn "view", so it's handled
@@ -120,15 +116,11 @@ async function submitSlotOverride(frameId, slotName, value) {
   setBusy(true);
   try {
     const view = await api(
-      `/demo/calls/${state.callId}/frames/${frameId}/slots/${encodeURIComponent(slotName)}`,
-      { method: "POST", body: JSON.stringify({ value }) },
+      `/v1/calls/${state.callId}/frames/${frameId}/slots/${encodeURIComponent(slotName)}`,
+      { method: "PATCH", body: JSON.stringify({ value }) },
     );
-    if (view.error) {
-      flash(view.error);
-    } else {
-      state.turns.push(view);
-      state.selected = state.turns.length - 1;
-    }
+    state.turns.push(view);
+    state.selected = state.turns.length - 1;
   } catch (err) {
     flash("Couldn't save correction: " + err.message);
   } finally {
@@ -229,16 +221,12 @@ async function playTranscript(turns) {
 
       let view;
       try {
-        view = await api(`/demo/calls/${state.callId}/turns`, {
+        view = await api(`/v1/calls/${state.callId}/turns`, {
           method: "POST",
-          body: JSON.stringify({ utterance: `${speaker}: ${utterance}` }),
+          body: JSON.stringify({ utterance, speaker: speaker.toLowerCase() }),
         });
       } catch (err) {
         flash("Playback stopped: " + err.message);
-        break;
-      }
-      if (view.error) {
-        flash(view.error);
         break;
       }
       state.turns.push(view);
