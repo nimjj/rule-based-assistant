@@ -6,7 +6,7 @@
 # then corrects something they said two turns ago. This module is what
 # remembers all of that across turns.
 #
-# Frames exactly as specified in the root CLAUDE.md: OPEN, AWAITING_INFO,
+# Frames exactly as specified in the design: OPEN, AWAITING_INFO,
 # FIRED, REVERTED. Each detected intent becomes a frame that tracks which of
 # its required slots are still missing; later turns either fill those slots,
 # open a new frame (interruption), or revert a previous one (correction).

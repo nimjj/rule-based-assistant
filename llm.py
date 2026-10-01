@@ -1,6 +1,6 @@
 # Stage 4: LLM escalation.
 #
-# Per design (root CLAUDE.md), the LLM is only invoked for:
+# By design, the LLM is only invoked for:
 #   - disambiguating between close-scoring intent candidates
 #   - multiple intents in one utterance
 #   - references ("that one", "the previous order")

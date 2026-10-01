@@ -24,7 +24,7 @@ _BARE_NUMBER_RE = re.compile(rf"\b\d{{{config.BARE_NUMBER_MIN_DIGITS},}}\b")
 # config.DISCOUNT_CONTEXT_KEYWORDS appears somewhere in the same turn (true
 # across every sample transcript). Still just a heuristic -- a code-shaped
 # word with no such keyword nearby (or a false one that happens to sit next
-# to "code") is exactly the "still ambiguous" case CLAUDE.md scopes to the
+# to "code") is exactly the "still ambiguous" case the design scopes to the
 # LLM step.
 _code_len = rf"{config.DISCOUNT_CODE_MIN_LEN},{config.DISCOUNT_CODE_MAX_LEN}"
 _DISCOUNT_CODE_RE = re.compile(rf"\b(?=[A-Z0-9]{{{_code_len}}}\b)[A-Z]+[0-9]+[A-Z0-9]*\b")
