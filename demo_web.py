@@ -1,6 +1,7 @@
 # Browser demo page. Serves the static UI in static_demo/ and nothing else --
-# the page talks to the /v1 API in server.py (calls, turns, slot overrides,
-# transcripts), so there is no demo-only backend logic to keep in sync.
+# the page talks to the /v1 API in server.py (calls, turns, transcripts, and
+# slot overrides when enabled), so there is no demo-only backend logic to keep
+# in sync. /demo/config only tells the page which optional features are on.
 #
 # Mounted by server.py: app.include_router(demo_router). Open /demo.
 
@@ -8,6 +9,8 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
+
+import config
 
 router = APIRouter()
 
@@ -18,6 +21,11 @@ _ASSETS = {"app.js": "text/javascript", "style.css": "text/css"}
 @router.get("/demo", include_in_schema=False)
 def demo_page():
     return FileResponse(_STATIC / "index.html")
+
+
+@router.get("/demo/config", include_in_schema=False)
+def demo_config():
+    return {"slot_override_enabled": config.SLOT_OVERRIDE_ENABLED}
 
 
 @router.get("/demo/static/{name}", include_in_schema=False)

@@ -62,7 +62,14 @@ def client(monkeypatch, tmp_path, request):
     monkeypatch.setattr(server, "_now", lambda: clock.now)
     clock.now = 1000.0
     monkeypatch.setattr(config, "CALL_IDLE_TIMEOUT_SECONDS", 600)
+    monkeypatch.setattr(config, "SLOT_OVERRIDE_ENABLED", False)
     return TestClient(server.app, raise_server_exceptions=False)
+
+
+@pytest.fixture
+def slot_override(monkeypatch):
+    """Turn on the archived slot override endpoint for one test."""
+    monkeypatch.setattr(config, "SLOT_OVERRIDE_ENABLED", True)
 
 
 class clock:
@@ -186,7 +193,7 @@ def test_unknown_call_404(client, method, path):
     assert_error(getattr(client, method)(path), 404, "call_not_found")
 
 
-def test_unknown_call_on_override(client):
+def test_unknown_call_on_override(client, slot_override):
     r = client.patch("/v1/calls/nope/frames/1/slots/order_id", json={"value": "ORD-1234"})
     assert_error(r, 404, "call_not_found")
 
@@ -360,9 +367,25 @@ def test_pipeline_exception_is_500_with_error_shape(client, monkeypatch):
     assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 0
 
 
-# -- slot override -------------------------------------------------------------
+# -- slot override (archived) ----------------------------------------------------
 
-def test_override_refires_tool_with_corrected_value(client):
+def test_override_disabled_by_default(client):
+    cid = new_call(client)
+    turn(client, cid, "track my order")
+    r = client.patch(f"/v1/calls/{cid}/frames/1/slots/order_id", json={"value": "ORD-22222"})
+    assert_error(r, 404, "endpoint_disabled")
+    assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 1
+    assert client.get("/demo/config").json() == {"slot_override_enabled": False}
+
+
+def test_override_listed_as_archived(client):
+    spec = client.get("/openapi.json").json()
+    op = spec["paths"]["/v1/calls/{call_id}/frames/{frame_id}/slots/{slot_name}"]["patch"]
+    assert op["tags"] == ["archived"] and op["deprecated"] is True
+    assert spec["tags"][-1]["name"] == "archived"
+
+
+def test_override_refires_tool_with_corrected_value(client, slot_override):
     cid = new_call(client)
     turn(client, cid, "track my order")
     turn(client, cid, "ORD-11111")
@@ -377,7 +400,7 @@ def test_override_refires_tool_with_corrected_value(client):
     assert v["slots"]["frames"][0]["slots"]["order_id"] == "ORD-22222"
 
 
-def test_override_errors(client):
+def test_override_errors(client, slot_override):
     cid = new_call(client)
     turn(client, cid, "track my order")
     url = f"/v1/calls/{cid}/frames/1/slots"
@@ -389,7 +412,7 @@ def test_override_errors(client):
     assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 1
 
 
-def test_override_on_reverted_frame_is_409(client):
+def test_override_on_reverted_frame_is_409(client, slot_override):
     cid = new_call(client)
     turn(client, cid, "cancel it")  # opens cancel_order, awaiting order_id
     assert turn(client, cid, "actually never mind").json()["intent"]["turn_type"] == "ambiguous_continuation"

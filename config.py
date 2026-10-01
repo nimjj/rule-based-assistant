@@ -105,3 +105,11 @@ CATALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", 
 # holds; PBXware's hangup should still DELETE the call. 0 disables expiry.
 # Override with the env var of the same name.
 CALL_IDLE_TIMEOUT_SECONDS = int(os.environ.get("CALL_IDLE_TIMEOUT_SECONDS", "1800"))
+
+# -- server.py: archived endpoints --------------------------------------------
+
+# PATCH /v1/calls/{id}/frames/{frame_id}/slots/{slot_name} (agent slot
+# correction) is out of scope for the current release but kept in the code.
+# Off by default: the route answers 404 `endpoint_disabled` and the demo hides
+# its slot edit button. Set the env var of the same name to 1/true to turn it on.
+SLOT_OVERRIDE_ENABLED = os.environ.get("SLOT_OVERRIDE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")

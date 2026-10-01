@@ -533,6 +533,13 @@ app = FastAPI(
         {"name": "calls", "description": "Call lifecycle and turns."},
         {"name": "catalog", "description": "Intent and tool catalogs."},
         {"name": "ops", "description": "Logging and health."},
+        {
+            "name": "archived",
+            "description": (
+                "Out of scope for this release. Kept in the code but disabled unless "
+                "`SLOT_OVERRIDE_ENABLED` is set; while disabled it returns 404 `endpoint_disabled`."
+            ),
+        },
     ],
 )
 
@@ -654,7 +661,7 @@ def post_turn(
     | `correction` | correction | Low confidence plus the LLM agreed it refers back to the latest frame; that frame becomes `REVERTED`. |
     | `unknown_intent` | unknown | Nothing matched; no frame opens. |
     | `duplicate_suppressed` | duplicate | Would have reopened an intent whose frame already FIRED this call; nothing new opens or fires. |
-    | `slot_override` | override | Produced by `PATCH .../slots/{slot}`, never by this endpoint. |
+    | `slot_override` | override | Produced by the archived `PATCH .../slots/{slot}`, never by this endpoint. |
 
     `slots.frames[].tool_call` is set when a frame's required slots are all
     filled. Every tool is a mock except `search_zoho_lead`, which really
@@ -694,58 +701,6 @@ def post_transcript(call_id: CallIdPath, body: TranscriptRequest):
     with session.lock:
         frames = views.frames_view(session.store)
     return {"call_id": call_id, "turns": results, "frames": frames}
-
-
-@app.patch(
-    "/v1/calls/{call_id}/frames/{frame_id}/slots/{slot_name}",
-    response_model=TurnView,
-    tags=["calls"],
-    responses={
-        **_NOT_FOUND,
-        **_INVALID,
-        409: {"model": ErrorResponse, "description": "The frame was REVERTED."},
-    },
-)
-def override_slot(call_id: str, frame_id: int, slot_name: str, body: SlotOverrideRequest):
-    """Agent-driven correction of one slot (e.g. a misheard order ID). The value
-    goes through the same extractor a normal turn uses. If the frame's required
-    slots are all filled afterward, its tool call is rebuilt and **re-dispatched
-    with the corrected data**, even if it already fired once with the wrong one.
-    Counts as a turn (`turn_type` `slot_override`, speaker `agent`)."""
-    session = _get_session(call_id)
-    with session.lock:
-        store = session.store
-        frame = store.get_frame(frame_id)
-        if frame is None:
-            raise ApiError(404, "frame_not_found", f"No frame #{frame_id} in call {call_id!r}.")
-        if frame.status == "REVERTED":
-            raise ApiError(409, "frame_reverted", f"Frame #{frame_id} was reverted; nothing to override.")
-        if slot_name not in INTENTS.get(frame.intent, {}).get("required_slots", []):
-            raise ApiError(422, "invalid_slot", f"{slot_name!r} isn't a slot on {frame.intent}.")
-
-        try:
-            frame, refired = store.override_slot(frame_id, slot_name, body.value)
-        except ValueError as exc:
-            call_log.log_event(
-                "override_rejected", call_id=call_id, frame_id=frame_id, slot=slot_name,
-                value=body.value, error=str(exc),
-            )
-            raise ApiError(422, "invalid_slot_value", str(exc)) from exc
-
-        session.turn_count += 1
-        session.touch()
-        view = views.build_turn_view(views.build_override_trace(frame, slot_name, refired), store, session.turn_count)
-
-    logger.info(
-        "call=%s turn=%d override %s#%d.%s -> %r%s",
-        call_id, view["turn_index"], frame.intent, frame.id, slot_name, frame.slots[slot_name],
-        " | MCP refired" if refired else "",
-    )
-    call_log.log_event(
-        "slot_override", call_id=call_id, turn_index=view["turn_index"], frame_id=frame.id,
-        slot=slot_name, value=views.to_jsonable(frame.slots[slot_name]), refired=refired, view=view,
-    )
-    return view
 
 
 # -- catalog ------------------------------------------------------------------
@@ -965,3 +920,67 @@ def health():
     except Exception:
         ollama_up = False
     return HealthResponse(status="ok" if ollama_up else "degraded", ollama=ollama_up, model=llm.MODEL_NAME)
+
+
+# -- archived -------------------------------------------------------------------
+#
+# Out of scope for this release, kept in the code. Off unless
+# config.SLOT_OVERRIDE_ENABLED; checked per request so the flag is the only switch.
+
+
+@app.patch(
+    "/v1/calls/{call_id}/frames/{frame_id}/slots/{slot_name}",
+    response_model=TurnView,
+    tags=["archived"],
+    deprecated=True,
+    responses={
+        **_NOT_FOUND,
+        **_INVALID,
+        409: {"model": ErrorResponse, "description": "The frame was REVERTED."},
+    },
+)
+def override_slot(call_id: str, frame_id: int, slot_name: str, body: SlotOverrideRequest):
+    """**Archived: disabled unless `SLOT_OVERRIDE_ENABLED` is set** (otherwise
+    404 `endpoint_disabled`).
+
+    Agent-driven correction of one slot (e.g. a misheard order ID). The value
+    goes through the same extractor a normal turn uses. If the frame's required
+    slots are all filled afterward, its tool call is rebuilt and **re-dispatched
+    with the corrected data**, even if it already fired once with the wrong one.
+    Counts as a turn (`turn_type` `slot_override`, speaker `agent`)."""
+    if not config.SLOT_OVERRIDE_ENABLED:
+        raise ApiError(404, "endpoint_disabled", "Slot override is archived and disabled on this server.")
+    session = _get_session(call_id)
+    with session.lock:
+        store = session.store
+        frame = store.get_frame(frame_id)
+        if frame is None:
+            raise ApiError(404, "frame_not_found", f"No frame #{frame_id} in call {call_id!r}.")
+        if frame.status == "REVERTED":
+            raise ApiError(409, "frame_reverted", f"Frame #{frame_id} was reverted; nothing to override.")
+        if slot_name not in INTENTS.get(frame.intent, {}).get("required_slots", []):
+            raise ApiError(422, "invalid_slot", f"{slot_name!r} isn't a slot on {frame.intent}.")
+
+        try:
+            frame, refired = store.override_slot(frame_id, slot_name, body.value)
+        except ValueError as exc:
+            call_log.log_event(
+                "override_rejected", call_id=call_id, frame_id=frame_id, slot=slot_name,
+                value=body.value, error=str(exc),
+            )
+            raise ApiError(422, "invalid_slot_value", str(exc)) from exc
+
+        session.turn_count += 1
+        session.touch()
+        view = views.build_turn_view(views.build_override_trace(frame, slot_name, refired), store, session.turn_count)
+
+    logger.info(
+        "call=%s turn=%d override %s#%d.%s -> %r%s",
+        call_id, view["turn_index"], frame.intent, frame.id, slot_name, frame.slots[slot_name],
+        " | MCP refired" if refired else "",
+    )
+    call_log.log_event(
+        "slot_override", call_id=call_id, turn_index=view["turn_index"], frame_id=frame.id,
+        slot=slot_name, value=views.to_jsonable(frame.slots[slot_name]), refired=refired, view=view,
+    )
+    return view

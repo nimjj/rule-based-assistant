@@ -7,6 +7,10 @@
 
 const state = { callId: null, turns: [], selected: -1, playing: false, speaker: "Customer" };
 
+// Optional server features, from /demo/config. Slot override is archived
+// server-side (config.SLOT_OVERRIDE_ENABLED); its edit button only shows when on.
+const features = { slotOverride: false };
+
 const $ = (sel) => document.querySelector(sel);
 
 function esc(s) {
@@ -111,6 +115,7 @@ async function sendTurn() {
 
 // -- slot override (agent correction) ---------------------------------------
 //
+// Archived: only wired up when /demo/config reports slot_override_enabled.
 // Inline edit on any slot row in panel 2: click the pencil, type the
 // corrected value, Save. Backed by demo_web.py's
 // PATCH /v1/calls/{id}/frames/{frame_id}/slots/{slot_name}, which re-runs
@@ -355,7 +360,7 @@ function renderSlots(view) {
     if (f.required.length === 0) {
       rows = `<div class="slot slot-none">no slots required &rarr; fires immediately</div>`;
     } else {
-      const editable = f.status !== "REVERTED";
+      const editable = features.slotOverride && f.status !== "REVERTED";
       rows = f.required.map((name) => {
         const filled = Object.prototype.hasOwnProperty.call(f.slots, name);
         const justNow = f.filled_this_turn.includes(name);
@@ -459,4 +464,7 @@ window.addEventListener("DOMContentLoaded", () => {
   slotsBody.addEventListener("click", onSlotsPanelClick);
   slotsBody.addEventListener("keydown", onSlotsPanelKeydown);
   newCall();
+  api("/demo/config")
+    .then((cfg) => { features.slotOverride = !!cfg.slot_override_enabled; render(); })
+    .catch(() => { /* keep optional features off */ });
 });
