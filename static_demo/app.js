@@ -280,8 +280,15 @@ function render() {
   renderMcp(view);
 }
 
+// Turn count at the last transcript render: follow the bottom only when a
+// turn was added, so selecting a turn doesn't jump the list.
+let renderedTurnCount = 0;
+
 function renderTranscript() {
   const box = $("#transcript");
+  const prevScroll = box.scrollTop;
+  const grew = state.turns.length > renderedTurnCount;
+  renderedTurnCount = state.turns.length;
   box.innerHTML = "";
   if (!state.turns.length) {
     box.innerHTML = placeholder("No turns yet. Type below to start the call.");
@@ -300,7 +307,7 @@ function renderTranscript() {
     row.onclick = () => { state.selected = i; render(); };
     box.appendChild(row);
   });
-  box.scrollTop = box.scrollHeight;
+  box.scrollTop = grew ? box.scrollHeight : prevScroll;
 }
 
 function renderIntent(view) {
