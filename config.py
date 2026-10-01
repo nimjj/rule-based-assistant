@@ -2,6 +2,8 @@
 # and correction/reference heuristics actually have somewhere to plug in
 # (the state store's turn-handling logic in state_store.py).
 
+import os
+
 # Sentence embedding model used for intent retrieval (embeddings.py). Small
 # and CPU-friendly; swap this to retune retrieval quality/speed without
 # touching embeddings.py itself.
@@ -86,3 +88,20 @@ PRODUCT_NAME_MIN_WORD_LEN = 2
 
 # Longest run of Title-Case words captured as a single product name.
 PRODUCT_NAME_MAX_WORDS = 5
+
+# -- catalog.py: admin-edited intent/tool catalog -----------------------------
+
+# Where edits made through the /v1/intents and /v1/tools write endpoints are
+# saved. Loaded over the defaults in intents.py / mcp_tools.py at startup when
+# present; delete it to go back to those defaults.
+CATALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "catalog.json")
+
+# -- server.py: call memory ----------------------------------------------------
+
+# A call with no activity (turn, transcript, slot override, reset) for this
+# many seconds is dropped from memory; reads of it then get 404
+# `call_expired`, and a new turn starts it over empty. Reading state
+# (GET /v1/calls/{id}) doesn't count as activity. 30 min leaves room for long
+# holds; PBXware's hangup should still DELETE the call. 0 disables expiry.
+# Override with the env var of the same name.
+CALL_IDLE_TIMEOUT_SECONDS = int(os.environ.get("CALL_IDLE_TIMEOUT_SECONDS", "1800"))

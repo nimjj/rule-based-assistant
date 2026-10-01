@@ -12,6 +12,7 @@
 # TODO - stage5: Learning mechansim via LLM at the end of day, Human-in-the-loop
 INTENTS = {
     "track_order": {
+        "label": "Track Order",
         "exemplars": [
             "Where is my order",
             "Can you check the status of my order",
@@ -24,6 +25,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "cancel_order": {
+        "label": "Cancel Order",
         "exemplars": [
             "Can I cancel my order",
             "I'd like to cancel this order",
@@ -34,6 +36,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "modify_order": {
+        "label": "Modify Order",
         "exemplars": [
             "Can I change my order after placing it",
             "I need to update the shipping address on my order",
@@ -44,6 +47,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "change_delivery_date": {
+        "label": "Change Delivery Date",
         "exemplars": [
             "Can I change my delivery date",
             "Can you reschedule my delivery to next week",
@@ -53,6 +57,7 @@ INTENTS = {
         "required_slots": ["order_id", "new_date"],
     },
     "report_delivery_problem": {
+        "label": "Delivery Problem",
         "exemplars": [
             "My package arrived damaged",
             "It says delivered but I never got it",
@@ -63,6 +68,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "payment_declined": {
+        "label": "Payment Declined",
         "exemplars": [
             "My card was declined at checkout",
             "Why didn't my payment go through",
@@ -72,6 +78,7 @@ INTENTS = {
         "required_slots": [],
     },
     "payment_info": {
+        "label": "Payment Information",
         "exemplars": [
             "What payment methods do you accept",
             "Do you accept PayPal or Apple Pay",
@@ -82,6 +89,7 @@ INTENTS = {
         "required_slots": [],
     },
     "billing_dispute": {
+        "label": "Billing Dispute",
         "exemplars": [
             "I was charged twice for one order",
             "The charge on my statement doesn't match my order total",
@@ -91,6 +99,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "request_invoice": {
+        "label": "Request Invoice",
         "exemplars": [
             "Can I get a copy of my receipt",
             "I need an invoice for my order",
@@ -101,6 +110,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "check_product_availability": {
+        "label": "Product Availability",
         "exemplars": [
             "Is the Aurora Desk Lamp in stock",
             "When will the Marlow Sofa be back in stock",
@@ -112,6 +122,7 @@ INTENTS = {
         "required_slots": ["product_name"],
     },
     "product_information": {
+        "label": "Product Information",
         "exemplars": [
             "What are the dimensions of the Marlow Sofa",
             "How big is the Aurora Desk Lamp",
@@ -123,6 +134,7 @@ INTENTS = {
         "required_slots": ["product_name"],
     },
     "return_policy_info": {
+        "label": "Return Policy",
         "exemplars": [
             "What's your return policy",
             "How long do I have to return something",
@@ -133,6 +145,7 @@ INTENTS = {
         "required_slots": [],
     },
     "initiate_return": {
+        "label": "Start a Return",
         "exemplars": [
             "How do I start a return",
             "I want to return an item from my order",
@@ -141,6 +154,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "check_refund_status": {
+        "label": "Refund Status",
         "exemplars": [
             "How long does a refund take",
             "My refund hasn't shown up yet",
@@ -149,6 +163,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "exchange_item": {
+        "label": "Exchange Item",
         "exemplars": [
             "Can I exchange this for a different size",
             "I want to swap this item for something else",
@@ -157,6 +172,7 @@ INTENTS = {
         "required_slots": ["order_id"],
     },
     "check_current_promotions": {
+        "label": "Current Promotions",
         "exemplars": [
             "Do you have any discount codes right now",
             "Are there any promotions running at the moment",
@@ -165,6 +181,7 @@ INTENTS = {
         "required_slots": [],
     },
     "promo_code_issue": {
+        "label": "Promo Code Issue",
         "exemplars": [
             "My promo code isn't working",
             "Can I apply a discount code after I've already ordered",
@@ -174,6 +191,7 @@ INTENTS = {
         "required_slots": ["discount_code"],
     },
     "loyalty_program_info": {
+        "label": "Loyalty Program",
         "exemplars": [
             "Do you have a loyalty program",
             "How do I redeem my rewards points",
@@ -184,6 +202,7 @@ INTENTS = {
         "required_slots": [],
     },
     "price_match_request": {
+        "label": "Price Match Request",
         "exemplars": [
             "Do you price match other retailers",
             "I found this cheaper somewhere else, can you match it",
@@ -191,6 +210,7 @@ INTENTS = {
         "required_slots": [],
     },
     "account_management": {
+        "label": "Account Management",
         "exemplars": [
             "How do I reset my password",
             "I need to update the email on my account",
@@ -202,6 +222,7 @@ INTENTS = {
         "required_slots": [],
     },
     "website_technical_issue": {
+        "label": "Website Issue",
         "exemplars": [
             "The checkout page keeps freezing",
             "I can't add anything to my cart",
@@ -211,6 +232,7 @@ INTENTS = {
         "required_slots": [],
     },
     "gift_card_inquiry": {
+        "label": "Gift Card Inquiry",
         "exemplars": [
             "Can I buy a gift card",
             "How do I check my gift card balance",
@@ -221,6 +243,7 @@ INTENTS = {
         "required_slots": [],
     },
     "request_human_agent": {
+        "label": "Request Human Agent",
         "exemplars": [
             "Can I talk to a real person",
             "I want to speak with a human agent",
@@ -229,6 +252,7 @@ INTENTS = {
         "required_slots": [],
     },
     "file_complaint": {
+        "label": "File a Complaint",
         "exemplars": [
             "I want to file a complaint about my order",
             "I'm really unhappy with how this was handled",
@@ -239,6 +263,7 @@ INTENTS = {
         "required_slots": [],
     },
     "lookup_crm_record": {
+        "label": "CRM Record Lookup",
         "exemplars": [
             "Can you pull up my account using my email",
             "Look up my info using my email",

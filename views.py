@@ -5,6 +5,7 @@
 # I/O and no FastAPI, so they're testable without a server.
 
 from intents import INTENTS
+from mcp_tools import TOOLS
 
 # turn_type (from state_store.process_utterance) -> a short decision label.
 # Coarser than turn_type, meant for badges / at-a-glance summaries.
@@ -20,6 +21,34 @@ DECISION_BY_TURN_TYPE = {
     "duplicate_suppressed": "duplicate",
     "slot_override": "override",
 }
+
+
+def humanize(name):
+    """Fallback label for a catalog entry with none set: "check_refund_status"
+    -> "Check Refund Status"."""
+    return name.replace("_", " ").title()
+
+
+# Labels are looked up at view time (not stored on frames), so a label edited
+# through the catalog API shows up immediately, including on live calls. A
+# name that's no longer in the catalog (deleted mid-call) falls back too.
+def intent_label(name):
+    if name is None:
+        return None
+    return INTENTS.get(name, {}).get("label") or humanize(name)
+
+
+def tool_label(name):
+    if name is None:
+        return None
+    return TOOLS.get(name, {}).get("label") or humanize(name)
+
+
+def tool_call_view(tool_call):
+    """A tool call with its display label alongside the tool name."""
+    if not tool_call:
+        return tool_call
+    return {**tool_call, "tool_label": tool_label(tool_call.get("tool"))}
 
 
 def slot_display(value):
@@ -47,13 +76,14 @@ def frame_view(frame, filled_this_turn=()):
     return {
         "id": frame.id,
         "intent": frame.intent,
+        "intent_label": intent_label(frame.intent),
         "status": frame.status,
         "initiated_by": frame.initiated_by,
         "required": INTENTS.get(frame.intent, {}).get("required_slots", []),
         "slots": {k: slot_display(v) for k, v in frame.slots.items()},
         "missing": list(frame.missing_slots),
         "filled_this_turn": list(filled_this_turn),
-        "tool_call": frame.tool_call,
+        "tool_call": tool_call_view(frame.tool_call),
         "tool_result": frame.tool_result,
     }
 
@@ -67,7 +97,7 @@ def frames_view(store, filled_this_turn=(), focus_frame_id=None):
 
 def all_tool_calls(store):
     return [
-        {"frame": f.id, "intent": f.intent, **f.tool_call}
+        {"frame": f.id, "intent": f.intent, "intent_label": intent_label(f.intent), **tool_call_view(f.tool_call)}
         for f in store.frames
         if f.tool_call
     ]
@@ -77,17 +107,21 @@ def build_turn_view(trace, store, turn_index):
     turn_type = trace.get("turn_type", "unknown_intent")
 
     candidates = [
-        {"intent": name, "score": round(float(score), 3)}
+        {"intent": name, "label": intent_label(name), "score": round(float(score), 3)}
         for name, score in trace.get("candidates", [])
     ]
 
     # Which intent(s) the turn settled on.
     selected = trace.get("intent")
+    selected_label = intent_label(selected)
     if selected is None and turn_type == "multi_intent_blocked":
-        selected = " + ".join(trace.get("intents", [])) or None
+        names = trace.get("intents", [])
+        selected = " + ".join(names) or None
+        selected_label = " + ".join(intent_label(n) for n in names) or None
     elif selected is None and "frame" in trace:
         frame = store.get_frame(trace["frame"])
         selected = frame.intent if frame else None
+        selected_label = intent_label(selected)
 
     escalation = None
     esc = trace.get("llm_escalation")
@@ -114,6 +148,7 @@ def build_turn_view(trace, store, turn_index):
             "turn_type": turn_type,
             "decision": DECISION_BY_TURN_TYPE.get(turn_type, turn_type),
             "selected_intent": selected,
+            "selected_intent_label": selected_label,
             "top_score": candidates[0]["score"] if candidates else None,
             "candidates": candidates,
             "heuristic_flags": trace.get("heuristic_flags", []),
@@ -122,7 +157,7 @@ def build_turn_view(trace, store, turn_index):
         },
         "slots": {"frames": frames_view(store, filled, trace.get("frame"))},
         "mcp": {
-            "fired_this_turn": to_jsonable(trace.get("tool_calls", [])),
+            "fired_this_turn": [tool_call_view(c) for c in to_jsonable(trace.get("tool_calls", []))],
             "all_calls": all_tool_calls(store),
         },
     }

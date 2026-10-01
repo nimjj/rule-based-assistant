@@ -17,6 +17,8 @@
 # way a customer saying it would), so there's one shared index rather than a
 # second exemplar catalogue to keep in sync.
 
+import threading
+
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
@@ -36,9 +38,11 @@ MODEL_NAME = config.EMBEDDING_MODEL_NAME  # small, fast, CPU-friendly
 # AWAITING_INFO frame's slot actually get filled instead.
 
 _model = None
-_exemplar_texts = []
-_exemplar_intents = []
-_exemplar_matrix = None
+# (exemplar_intents, exemplar_matrix), swapped in as one tuple so a turn never
+# sees intents from one build and vectors from another. None = (re)build on
+# the next retrieve(); catalog.py sets that after an admin edit.
+_index = None
+_index_lock = threading.Lock()
 
 
 def _get_model():
@@ -49,28 +53,45 @@ def _get_model():
 
 
 def _build_index():
-    global _exemplar_texts, _exemplar_intents, _exemplar_matrix
-    model = _get_model()
-    for intent, spec in INTENTS.items():
+    # Copy first: catalog.py replaces specs wholesale rather than mutating
+    # them, so this snapshot is consistent even mid-edit.
+    texts, intents = [], []
+    for intent, spec in dict(INTENTS).items():
         for text in spec["exemplars"]:
-            _exemplar_texts.append(text)
-            _exemplar_intents.append(intent)
-    _exemplar_matrix = model.encode(
-        _exemplar_texts, normalize_embeddings=True, convert_to_numpy=True
-    )
+            texts.append(text)
+            intents.append(intent)
+    matrix = _get_model().encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+    return intents, matrix
+
+
+def _get_index():
+    global _index
+    index = _index
+    if index is None:
+        with _index_lock:
+            if _index is None:
+                _index = _build_index()
+            index = _index
+    return index
+
+
+def invalidate_index():
+    """Drop the exemplar index; the next retrieve() re-embeds the catalog."""
+    global _index
+    with _index_lock:
+        _index = None
 
 
 def retrieve(utterance, top_k=config.RETRIEVAL_TOP_K):
     """Return up to top_k (intent, score) pairs, best first, deduplicated by intent."""
-    if _exemplar_matrix is None:
-        _build_index()
+    exemplar_intents, exemplar_matrix = _get_index()
 
     model = _get_model()
     query_vec = model.encode([utterance], normalize_embeddings=True, convert_to_numpy=True)[0]
-    sims = _exemplar_matrix @ query_vec  # cosine similarity (vectors are normalized)
+    sims = exemplar_matrix @ query_vec  # cosine similarity (vectors are normalized)
 
     best_per_intent = {}
-    for score, intent in zip(sims, _exemplar_intents):
+    for score, intent in zip(sims, exemplar_intents):
         if intent not in best_per_intent or score > best_per_intent[intent]:
             best_per_intent[intent] = float(score)
 

@@ -48,8 +48,16 @@ function setBusy(busy) {
 
 // -- actions --------------------------------------------------------------
 
+// In production the call ID comes from PBXware; the demo makes up its own.
+function demoCallId() {
+  return "demo-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
 async function createCall() {
-  const { call_id } = await api("/v1/calls", { method: "POST" });
+  const { call_id } = await api("/v1/calls", {
+    method: "POST",
+    body: JSON.stringify({ call_id: demoCallId() }),
+  });
   state.callId = call_id;
   state.turns = [];
   state.selected = -1;

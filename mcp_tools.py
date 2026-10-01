@@ -7,6 +7,7 @@
 
 TOOLS = {
     "get_order_status": {
+        "label": "Get Order Status",
         "description": "Look up the shipping/tracking status of a customer's order.",
         "inputSchema": {
             "type": "object",
@@ -17,6 +18,7 @@ TOOLS = {
         },
     },
     "cancel_order": {
+        "label": "Cancel Order",
         "description": "Cancel an order (or a recurring/subscription order) before it ships.",
         "inputSchema": {
             "type": "object",
@@ -27,6 +29,7 @@ TOOLS = {
         },
     },
     "update_order": {
+        "label": "Update Order",
         "description": "Apply a change to an existing order -- shipping address, item, size/color, or merging shipments.",
         "inputSchema": {
             "type": "object",
@@ -37,6 +40,7 @@ TOOLS = {
         },
     },
     "reschedule_delivery": {
+        "label": "Reschedule Delivery",
         "description": "Move an order's delivery to a new date.",
         "inputSchema": {
             "type": "object",
@@ -48,6 +52,7 @@ TOOLS = {
         },
     },
     "report_delivery_issue": {
+        "label": "Report Delivery Issue",
         "description": "File a delivery problem report (damaged, missing, wrong item, wrong address) against an order.",
         "inputSchema": {
             "type": "object",
@@ -58,14 +63,17 @@ TOOLS = {
         },
     },
     "troubleshoot_payment": {
+        "label": "Troubleshoot Payment",
         "description": "Diagnose a declined or failed payment attempt at checkout.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "get_payment_info": {
+        "label": "Get Payment Info",
         "description": "Look up accepted payment methods and billing timing/policy.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "file_billing_dispute": {
+        "label": "File Billing Dispute",
         "description": "Open a dispute/refund request for an incorrect or duplicate charge on a specific order.",
         "inputSchema": {
             "type": "object",
@@ -76,6 +84,7 @@ TOOLS = {
         },
     },
     "send_invoice": {
+        "label": "Send Invoice",
         "description": "Email a receipt/itemized invoice for a specific order.",
         "inputSchema": {
             "type": "object",
@@ -86,6 +95,7 @@ TOOLS = {
         },
     },
     "get_product_availability": {
+        "label": "Check Product Availability",
         "description": "Check stock/size/color availability for a named product.",
         "inputSchema": {
             "type": "object",
@@ -96,6 +106,7 @@ TOOLS = {
         },
     },
     "get_product_details": {
+        "label": "Get Product Details",
         "description": "Look up specs, materials, warranty, reviews, or sample availability for a named product.",
         "inputSchema": {
             "type": "object",
@@ -106,10 +117,12 @@ TOOLS = {
         },
     },
     "get_return_policy": {
+        "label": "Get Return Policy",
         "description": "Look up general return/exchange policy (window, return shipping, sale items, packaging).",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "start_return": {
+        "label": "Start Return",
         "description": "Begin a return for an item on a specific order.",
         "inputSchema": {
             "type": "object",
@@ -120,6 +133,7 @@ TOOLS = {
         },
     },
     "get_refund_status": {
+        "label": "Get Refund Status",
         "description": "Check the processing status of a refund for a specific order.",
         "inputSchema": {
             "type": "object",
@@ -130,6 +144,7 @@ TOOLS = {
         },
     },
     "start_exchange": {
+        "label": "Start Exchange",
         "description": "Begin an exchange (different size/product) for an item on a specific order.",
         "inputSchema": {
             "type": "object",
@@ -140,10 +155,12 @@ TOOLS = {
         },
     },
     "get_current_promotions": {
+        "label": "Get Current Promotions",
         "description": "List discount codes/promotions currently active.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "validate_discount_code": {
+        "label": "Validate Discount Code",
         "description": "Check why a discount code isn't applying, or whether it can still be applied/stacked.",
         "inputSchema": {
             "type": "object",
@@ -154,35 +171,45 @@ TOOLS = {
         },
     },
     "get_loyalty_info": {
+        "label": "Get Loyalty Info",
         "description": "Look up loyalty/rewards program details or a customer's points balance.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "submit_price_match_request": {
+        "label": "Submit Price Match",
         "description": "Submit a price-match request against a competitor's listing.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "open_account_request": {
+        "label": "Open Account Request",
         "description": "Handle an account-management request: password reset, email change, deletion, order history, verification email, saved addresses.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "report_technical_issue": {
+        "label": "Report Technical Issue",
         "description": "File a website/technical bug report (checkout, cart, form fields, missing emails).",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "get_gift_card_info": {
+        "label": "Get Gift Card Info",
         "description": "Handle gift-card purchase, balance check, gift-wrapping, or expiry questions.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "transfer_to_agent": {
+        "label": "Transfer to Agent",
         "description": "Transfer the conversation to a human agent.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "file_complaint": {
+        "label": "File Complaint",
         "description": "Log a customer complaint/escalation, optionally tied to an order.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     "search_zoho_lead": {
+        "label": "Search Zoho CRM Lead",
         "description": "Search Zoho CRM for a lead matching a customer's email address.",
+        # Really executes -- see BACKENDS / dispatch_tool_call.
+        "backend": "zoho_lead_search",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -245,18 +272,32 @@ def build_tool_call(intent, slots):
     return {"tool": tool_name, "arguments": arguments}
 
 
+def _zoho_lead_search(arguments):
+    import zoho_client
+    return zoho_client.search_lead(**arguments)
+
+
+# A tool's "backend" names the real call it executes. Keyed by backend, not
+# tool name, so a live tool keeps working when it's renamed. Tools without
+# one (every tool but search_zoho_lead) are mocks.
+BACKENDS = {"zoho_lead_search": _zoho_lead_search}
+
+
+def executes_live(tool_name):
+    return TOOLS.get(tool_name, {}).get("backend") in BACKENDS
+
+
 def dispatch_tool_call(tool_call):
-    """Execute a fired frame's tool call against a real backend, for the one
-    tool that's wired to one -- search_zoho_lead. Every other tool here is
-    still a mock the demo just displays; this returns None for all of them.
+    """Execute a fired frame's tool call against its tool's real backend.
+    Returns None for mock tools (no backend), which the demo just displays.
     """
     if tool_call is None:
         return None
-    if tool_call["tool"] != "search_zoho_lead":
+    backend = BACKENDS.get(TOOLS.get(tool_call["tool"], {}).get("backend"))
+    if backend is None:
         return None
-    import zoho_client
     try:
-        return zoho_client.search_lead(**tool_call["arguments"])
+        return backend(tool_call["arguments"])
     except Exception as exc:
         # Network/auth/response-shape failures on this one real backend call
         # shouldn't take down the whole conversation -- surface them as a
