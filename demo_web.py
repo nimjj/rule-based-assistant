@@ -4,15 +4,22 @@
 # in sync. /demo/config only tells the page which optional features are on.
 #
 # Mounted by server.py: app.include_router(demo_router). Open /demo.
+# Off unless config.DEMO_UI_ENABLED: every route here answers 404 otherwise.
 
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
 import config
 
-router = APIRouter()
+
+def _require_enabled():
+    if not config.DEMO_UI_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found.")
+
+
+router = APIRouter(dependencies=[Depends(_require_enabled)])
 
 _STATIC = Path(__file__).parent / "static_demo"
 _ASSETS = {"app.js": "text/javascript", "style.css": "text/css"}

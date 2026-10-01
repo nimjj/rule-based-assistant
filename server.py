@@ -33,12 +33,12 @@ import call_log
 import catalog
 import config
 import views
-from demo import parse_turns
 from demo_web import router as demo_router
 from intents import INTENTS
 from mcp_tools import INTENT_TO_TOOL, TOOLS, executes_live
 from slots import SLOT_EXTRACTORS
 from state_store import ConversationStateStore
+from transcripts import parse_turns
 
 logger = call_log.logger
 
@@ -543,7 +543,8 @@ app = FastAPI(
     ],
 )
 
-# Browser demo page only (/demo); it talks to the /v1 API above.
+# Browser demo page (/demo), served only when config.DEMO_UI_ENABLED; it
+# talks to the /v1 API above.
 app.include_router(demo_router)
 
 

@@ -1,20 +1,23 @@
 # Stage 3 demo: the conversational state store, on top of the Stage 1 gate
 # and Stage 2 slot extraction.
 #
-#   python demo.py call            # replay every samples/convo*.txt as a simulated live call
-#   python demo.py call convo2.txt # replay just one sample
-#   python demo.py live            # type turns yourself, multi-turn, until Ctrl+C
-#   python demo.py test            # score intent_test_dataset.xlsx (intent only, single-turn)
+#   python tools/demo.py call                  # replay every tools/samples/*.txt as a simulated live call
+#   python tools/demo.py call "easy (1).txt"   # replay just one sample
+#   python tools/demo.py live                  # type turns yourself, multi-turn, until Ctrl+C
+#   python tools/demo.py test                  # score intent_test_dataset.xlsx (intent only, single-turn)
 
 import argparse
 import glob
 import os
-import re
 import sys
 import time
 
-from gate import classify
-from state_store import ConversationStateStore
+# Run from anywhere: the pipeline modules live in the repo root, one level up.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from gate import classify  # noqa: E402
+from state_store import ConversationStateStore  # noqa: E402
+from transcripts import parse_turn, parse_turns  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -31,31 +34,6 @@ RESULTS_PATH = os.path.join(SCRIPT_DIR, "intent_test_results.xlsx")
 CUSTOMER_SPEAK_SECONDS = 2.0
 AGENT_SPEAK_SECONDS = 1.0
 THINKING_SECONDS = 0.4
-
-_TURN_RE = re.compile(r"^(Customer|Agent):\s*(.*)$", re.IGNORECASE)
-
-
-def parse_turn(line):
-    """Parse one "Customer: ..." / "Agent: ..." line -- the tagging real
-    transcripts (and this demo's live mode) always use. Returns
-    (speaker, utterance) with speaker normalized to "Customer"/"Agent", or
-    None if the line doesn't match that shape."""
-    match = _TURN_RE.match(line.strip())
-    if not match:
-        return None
-    speaker, utterance = match.group(1).capitalize(), match.group(2).strip()
-    return (speaker, utterance) if utterance else None
-
-
-def parse_turns(text):
-    """Parse every Customer/Agent line from a transcript, in order."""
-    turns = []
-    for line in text.splitlines():
-        turn = parse_turn(line)
-        if turn:
-            turns.append(turn)
-    return turns
-
 
 def warm_up():
     # Loads the embedding model up front, so no timed measurement (and no
@@ -130,9 +108,9 @@ def run_calls(names):
     if names:
         paths = [n if os.path.dirname(n) else os.path.join(SAMPLES_DIR, n) for n in names]
     else:
-        paths = sorted(glob.glob(os.path.join(SAMPLES_DIR, "convo*.txt")))
+        paths = sorted(glob.glob(os.path.join(SAMPLES_DIR, "*.txt")))
     if not paths:
-        print("No sample transcripts found (expected samples/convo*.txt).")
+        print("No sample transcripts found (expected tools/samples/*.txt).")
         return
     for path in paths:
         run_call(path)
@@ -218,7 +196,7 @@ def main():
     )
     parser.add_argument(
         "samples", nargs="*",
-        help="'call' mode only: specific sample file(s) under samples/ (default: all of them)",
+        help="'call' mode only: specific sample file(s) under tools/samples/ (default: all of them)",
     )
     args = parser.parse_args()
 

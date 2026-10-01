@@ -188,10 +188,10 @@ function onSlotsPanelKeydown(e) {
 
 // -- transcript upload / auto-play -----------------------------------------
 
-// Same "Speaker: text" convention as demo.py's parse_turn / real transcripts.
+// Same "Speaker: text" convention as transcripts.py's parse_turn / real transcripts.
 const TURN_RE = /^(Customer|Agent):\s*(.*)$/i;
 
-// demo.py's "call" mode simulates speaking delay at CUSTOMER_SPEAK_SECONDS=2.0 /
+// tools/demo.py's "call" mode simulates speaking delay at CUSTOMER_SPEAK_SECONDS=2.0 /
 // AGENT_SPEAK_SECONDS=1.0 before each turn appears. This is that same pacing
 // at 0.5x, for browser playback.
 const CUSTOMER_DELAY_MS = 1000;

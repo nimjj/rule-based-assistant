@@ -63,6 +63,7 @@ def client(monkeypatch, tmp_path, request):
     clock.now = 1000.0
     monkeypatch.setattr(config, "CALL_IDLE_TIMEOUT_SECONDS", 600)
     monkeypatch.setattr(config, "SLOT_OVERRIDE_ENABLED", False)
+    monkeypatch.setattr(config, "DEMO_UI_ENABLED", False)
     return TestClient(server.app, raise_server_exceptions=False)
 
 
@@ -70,6 +71,12 @@ def client(monkeypatch, tmp_path, request):
 def slot_override(monkeypatch):
     """Turn on the archived slot override endpoint for one test."""
     monkeypatch.setattr(config, "SLOT_OVERRIDE_ENABLED", True)
+
+
+@pytest.fixture
+def demo_ui(monkeypatch):
+    """Serve the /demo browser page for one test."""
+    monkeypatch.setattr(config, "DEMO_UI_ENABLED", True)
 
 
 class clock:
@@ -369,7 +376,7 @@ def test_pipeline_exception_is_500_with_error_shape(client, monkeypatch):
 
 # -- slot override (archived) ----------------------------------------------------
 
-def test_override_disabled_by_default(client):
+def test_override_disabled_by_default(client, demo_ui):
     cid = new_call(client)
     turn(client, cid, "track my order")
     r = client.patch(f"/v1/calls/{cid}/frames/1/slots/order_id", json={"value": "ORD-22222"})
@@ -758,7 +765,12 @@ def test_health_ok_and_degraded(client, monkeypatch):
     assert client.get("/health").json()["status"] == "degraded"
 
 
-def test_demo_page_and_assets_and_no_legacy_routes(client):
+def test_demo_ui_disabled_by_default(client):
+    for path in ["/demo", "/demo/config", "/demo/static/app.js"]:
+        assert_error(client.get(path), 404, "not_found")
+
+
+def test_demo_page_and_assets_and_no_legacy_routes(client, demo_ui):
     assert client.get("/demo").status_code == 200
     assert client.get("/demo/static/app.js").status_code == 200
     assert client.get("/demo/static/../server.py").status_code == 404

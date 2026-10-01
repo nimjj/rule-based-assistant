@@ -9,7 +9,7 @@ import os
 # touching embeddings.py itself.
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
-# How many top-scoring intent candidates retrieve() returns. gate.py and
+# How many top-scoring intent candidates retrieve() returns. tools/gate.py and
 # state_store.py both consume this many; raising it gives multi-intent
 # detection more candidates to compare, at the cost of scoring more exemplars.
 RETRIEVAL_TOP_K = 3
@@ -112,4 +112,15 @@ CALL_IDLE_TIMEOUT_SECONDS = int(os.environ.get("CALL_IDLE_TIMEOUT_SECONDS", "180
 # correction) is out of scope for the current release but kept in the code.
 # Off by default: the route answers 404 `endpoint_disabled` and the demo hides
 # its slot edit button. Set the env var of the same name to 1/true to turn it on.
-SLOT_OVERRIDE_ENABLED = os.environ.get("SLOT_OVERRIDE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+def _env_flag(name, default="0"):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+SLOT_OVERRIDE_ENABLED = _env_flag("SLOT_OVERRIDE_ENABLED")
+
+# -- demo_web.py: browser demo UI -----------------------------------------------
+
+# The /demo page (static_demo/) is a dev/sales tool, not part of the product.
+# Off by default: /demo and its assets answer 404. Set the env var of the same
+# name to 1/true to serve it (e.g. on a dev or demo box).
+DEMO_UI_ENABLED = _env_flag("DEMO_UI_ENABLED")

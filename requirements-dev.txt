@@ -1,0 +1,6 @@
+# Tests (pytest tests) and the offline tools: demo.py, build_test_dataset.py.
+-r requirements.txt
+pytest==7.4.4
+httpx==0.28.1
+pandas==2.3.3
+openpyxl==3.1.5

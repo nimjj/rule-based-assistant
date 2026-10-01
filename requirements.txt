@@ -1,11 +1,12 @@
-sentence-transformers>=5.0
-numpy
-pandas
-openpyxl
-dateparser
-ollama
-fastapi
-uvicorn
-python-dotenv
-pytest
-httpx
+# Runtime dependencies for the API server (uvicorn server:app). Python 3.12.
+# Pinned to the versions the test suite passes with; bump deliberately.
+# Dev/test tooling is in requirements-dev.txt.
+sentence-transformers==5.5.1
+torch==2.12.0
+numpy==1.26.4
+dateparser==1.4.2
+ollama==0.6.2
+fastapi==0.141.1
+pydantic==2.12.5
+uvicorn==0.52.4
+python-dotenv==0.21.0

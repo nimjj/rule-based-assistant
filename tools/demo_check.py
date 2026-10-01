@@ -1,13 +1,17 @@
-# Pre-flight for the web demo. Run this well before the session -- NOT live.
+# Pre-flight: run before starting the server (or a demo session) -- NOT live.
 #
-#     python demo_check.py
+#     python tools/demo_check.py
 #
 # Verifies every dependency the demo touches and pays the one-time costs up
 # front (embedding model load/download, Ollama warm-up) so the first live
 # turn is fast. Exits non-zero if anything the demo needs is missing.
 
+import os
 import sys
 import time
+
+# Run from anywhere: the pipeline modules live in the repo root, one level up.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def check_imports():
@@ -93,7 +97,7 @@ def main():
 
     print("\nAll checks passed.")
     print("Start:  uvicorn server:app")
-    print("Open:   http://127.0.0.1:8000/demo")
+    print("Demo:   http://127.0.0.1:8000/demo  (needs DEMO_UI_ENABLED=1)")
 
 
 if __name__ == "__main__":

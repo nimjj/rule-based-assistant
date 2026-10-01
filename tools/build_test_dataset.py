@@ -5,7 +5,11 @@
 # "unknown" utterances. Not part of the runtime pipeline -- run once to
 # regenerate the dataset, same convention as the rest of Stage 3's xlsx files.
 
+import os
+
 import pandas as pd
+
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intent_test_dataset.xlsx")
 
 ROWS = [
     ("I haven't heard anything about my order since I placed it", "track_order", "No 'status'/'track' keyword"),
@@ -59,5 +63,5 @@ ROWS = [
 
 df = pd.DataFrame(ROWS, columns=["Utterance", "Expected Intent", "Rule-based Challenge"])
 df.insert(0, "ID", range(1, len(df) + 1))
-df.to_excel("intent_test_dataset.xlsx", index=False)
-print(f"Wrote {len(df)} rows to intent_test_dataset.xlsx")
+df.to_excel(OUT, index=False)
+print(f"Wrote {len(df)} rows to {OUT}")
