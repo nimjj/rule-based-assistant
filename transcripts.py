@@ -1,5 +1,6 @@
 # "Customer: ..." / "Agent: ..." transcript parsing, shared by the
-# /v1/calls/{id}/transcript endpoint (server.py) and the CLI replay (demo.py).
+# /v1/tenants/{tenant_id}/calls/{call_id}/transcript endpoint (server.py) and
+# the CLI replay (demo.py).
 
 import re
 

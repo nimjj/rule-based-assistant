@@ -1,5 +1,6 @@
 # Structured logging for the API. Every call/turn/override/error is written
-# two ways:
+# two ways, tagged with tenant_id and call_id (plus the agent's user_id when
+# the request carried one):
 #   logs/api.log     human-readable, one line per event (also to console)
 #   logs/turns.jsonl one JSON object per event: the full view + raw trace
 # and read_events() serves the jsonl back (GET /v1/log).
@@ -42,9 +43,11 @@ def log_event(event, **fields):
         logger.exception("failed to append to %s", TURN_LOG.name)
 
 
-def read_events(limit=200, call_id=None):
-    """Most recent records (newest last), optionally for one call_id.
-    Returns (records, total_matching)."""
+def read_events(limit=200, **filters):
+    """Most recent records (newest last). Keyword filters (tenant_id, call_id,
+    user_id, ...) keep only records whose field equals the value; None means
+    no filter. Returns (records, total_matching)."""
+    filters = {k: v for k, v in filters.items() if v is not None}
     if not TURN_LOG.exists():
         return [], 0
     records = []
@@ -57,7 +60,7 @@ def read_events(limit=200, call_id=None):
                 rec = json.loads(line)
             except ValueError:
                 continue
-            if call_id and rec.get("call_id") != call_id:
+            if any(rec.get(k) != v for k, v in filters.items()):
                 continue
             records.append(rec)
     return records[-limit:], len(records)

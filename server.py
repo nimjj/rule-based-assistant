@@ -2,9 +2,9 @@
 # extraction, frame-based dialogue state, Gemma 3 1B LLM escalation).
 #
 # The pipeline is stateful within one call (frames persist turn to turn), so
-# this isn't a single stateless endpoint: POST /v1/calls starts a call and
-# hands back a call_id, then every turn for that call is fed into the same
-# ConversationStateStore.
+# this isn't a single stateless endpoint: the first turn for a new
+# (tenant ID, PBXware call ID) pair starts a call, then every turn for that
+# call is fed into the same ConversationStateStore.
 #
 # All response shaping lives in views.py; all pipeline logic in state_store.py.
 # This module is only routing, validation, session bookkeeping and errors.
@@ -23,7 +23,7 @@ from collections import OrderedDict
 from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
 from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, Path, Query, Request, Response
+from fastapi import FastAPI, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StringConstraints, model_validator
@@ -111,22 +111,24 @@ Utterance = Annotated[
 Speaker = Literal["customer", "agent"]
 
 
-# Call IDs come from the telephony system (PBXware), never generated here.
-# Permissive enough for Asterisk-style IDs ("1727690000.12345") and UUIDs, and
-# safe to use as a URL path segment.
-CALL_ID_PATTERN = r"^[A-Za-z0-9._:-]{1,128}$"
-CallId = Annotated[str, StringConstraints(pattern=CALL_ID_PATTERN)]
-CallIdPath = Annotated[str, Path(pattern=CALL_ID_PATTERN, description="The PBXware call ID.")]
+# Tenant and call IDs come from the telephony system (PBXware), never
+# generated here. Permissive enough for Asterisk-style IDs ("1727690000.12345")
+# and UUIDs, and safe to use as a URL path segment. A call is identified by
+# the pair: the same call ID under two tenants is two separate calls.
+ID_PATTERN = r"^[A-Za-z0-9._:-]{1,128}$"
+TenantIdPath = Annotated[str, Path(pattern=ID_PATTERN, description="The tenant ID.")]
+CallIdPath = Annotated[str, Path(pattern=ID_PATTERN, description="The PBXware call ID.")]
 
-
-class NewCallRequest(BaseModel):
-    call_id: CallId = Field(
-        ..., examples=["1727690000.12345"],
-        description="The PBXware call ID. 1-128 characters from `A-Z a-z 0-9 . _ : -`.",
-    )
+# The call agent handling the call. Only logged; never affects processing.
+UserId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
+_USER_ID_FIELD = Field(
+    default=None, examples=["agent-042"],
+    description="The call agent's user ID. Optional; only recorded in the logs, never affects processing.",
+)
 
 
 class NewCallResponse(BaseModel):
+    tenant_id: str = Field(..., examples=["acme"])
     call_id: str = Field(..., examples=["1727690000.12345"])
 
 
@@ -140,6 +142,7 @@ class TurnRequest(BaseModel):
             "is echoed back and becomes `initiated_by` on any frame this turn opens."
         ),
     )
+    user_id: UserId | None = _USER_ID_FIELD
 
 
 class TranscriptTurn(BaseModel):
@@ -160,6 +163,7 @@ class TranscriptRequest(BaseModel):
     turns: list[TranscriptTurn] | None = Field(
         default=None, max_length=MAX_TRANSCRIPT_TURNS, description="Pre-parsed turns, in order."
     )
+    user_id: UserId | None = _USER_ID_FIELD
 
     @model_validator(mode="after")
     def _exactly_one(self):
@@ -177,6 +181,7 @@ class SlotOverrideRequest(BaseModel):
             "it must look like a real value."
         ),
     )
+    user_id: UserId | None = _USER_ID_FIELD
 
 
 class Candidate(BaseModel):
@@ -221,7 +226,7 @@ class FrameView(BaseModel):
     slots: dict = Field(..., description="Filled slots. `new_date` is the resolved ISO date.")
     missing: list[str]
     filled_this_turn: list[str] = Field(
-        ..., description="Slots this turn filled on this frame (always [] from GET /v1/calls/{id})."
+        ..., description="Slots this turn filled on this frame (always [] from GET on the call)."
     )
     tool_call: dict | None = Field(
         default=None,
@@ -259,12 +264,14 @@ class TurnView(BaseModel):
 
 
 class CallStateResponse(BaseModel):
+    tenant_id: str
     call_id: str
     turn_count: int
     frames: list[FrameView]
 
 
 class TranscriptResponse(BaseModel):
+    tenant_id: str
     call_id: str
     turns: list[TurnView] = Field(..., description="One view per processed turn, in order.")
     frames: list[FrameView] = Field(..., description="Final state of every frame.")
@@ -358,7 +365,7 @@ class HealthResponse(BaseModel):
 # `call_expired` on time).
 SWEEP_INTERVAL_SECONDS = 60
 
-# Remember this many expired call_ids, so a late request gets `call_expired`
+# Remember this many expired calls, so a late request gets `call_expired`
 # rather than `call_not_found`.
 MAX_EXPIRED_IDS = 10_000
 
@@ -381,83 +388,99 @@ class CallSession:
         return timeout > 0 and _now() - self.last_activity > timeout
 
 
-_calls: dict[str, CallSession] = {}
-_expired_ids: OrderedDict[str, None] = OrderedDict()
+# Sessions are keyed by (tenant_id, call_id).
+CallKey = tuple[str, str]
+
+_calls: dict[CallKey, CallSession] = {}
+_expired_ids: OrderedDict[CallKey, None] = OrderedDict()
 # Serialises creating a call, so two first requests for the same new ID
-# (e.g. a create and a turn racing) end up on one session.
+# (e.g. two racing first turns) end up on one session.
 _create_lock = threading.Lock()
 
 
-def _expire(call_id: str, session: CallSession) -> None:
+def _ids(key: CallKey, user_id: str | None = None) -> dict:
+    """The identifying fields every call log record carries."""
+    ids = {"tenant_id": key[0], "call_id": key[1]}
+    if user_id is not None:
+        ids["user_id"] = user_id
+    return ids
+
+
+def _who(key: CallKey, user_id: str | None = None) -> str:
+    """Prefix for human-readable log lines."""
+    return f"tenant={key[0]} call={key[1]}" + (f" user={user_id}" if user_id else "")
+
+
+def _expire(key: CallKey, session: CallSession) -> None:
     """Drop an idle call. Caller holds session.lock."""
-    if _calls.get(call_id) is not session:
+    if _calls.get(key) is not session:
         return  # already deleted, reset or expired
-    del _calls[call_id]
-    _expired_ids[call_id] = None
+    del _calls[key]
+    _expired_ids[key] = None
     while len(_expired_ids) > MAX_EXPIRED_IDS:
         _expired_ids.popitem(last=False)
     idle = _now() - session.last_activity
-    logger.info("call=%s expired after %.0fs idle", call_id, idle)
-    call_log.log_event("call_expired", call_id=call_id, idle_seconds=round(idle), turn_count=session.turn_count)
+    logger.info("%s expired after %.0fs idle", _who(key), idle)
+    call_log.log_event("call_expired", **_ids(key), idle_seconds=round(idle), turn_count=session.turn_count)
 
 
-def _expired_error(call_id: str) -> ApiError:
+def _expired_error(key: CallKey) -> ApiError:
     return ApiError(
         404, "call_expired",
-        f"Call {call_id!r} expired after {config.CALL_IDLE_TIMEOUT_SECONDS}s without activity. "
-        "POST /v1/calls or send a turn to start it again.",
+        f"Call {key[1]!r} for tenant {key[0]!r} expired after {config.CALL_IDLE_TIMEOUT_SECONDS}s "
+        "without activity. Send a turn to start it again.",
     )
 
 
-def _get_session(call_id: str, touch: bool = True) -> CallSession:
+def _get_session(key: CallKey, touch: bool = True) -> CallSession:
     """Look up a live call. `touch` counts this request as activity; pass
     False for read-only requests so they don't keep an idle call alive."""
-    session = _calls.get(call_id)
+    session = _calls.get(key)
     if session is None:
-        if call_id in _expired_ids:
-            raise _expired_error(call_id)
+        if key in _expired_ids:
+            raise _expired_error(key)
         raise ApiError(
-            404, "call_not_found", f"No call with id {call_id!r}. POST /v1/calls or send a turn to start one."
+            404, "call_not_found", f"No call {key[1]!r} for tenant {key[0]!r}. Send a turn to start one."
         )
     with session.lock:
         if session.is_idle():
-            _expire(call_id, session)
-            raise _expired_error(call_id)
+            _expire(key, session)
+            raise _expired_error(key)
         if touch:
             session.touch()
     return session
 
 
-def _get_or_create_session(call_id: str, source: str) -> tuple[CallSession, bool]:
-    """The live call for this ID, or a new one. Returns (session, created). An
-    expired call starts over empty. `source` is logged ("create" or "turn")."""
+def _get_or_create_session(key: CallKey, source: str, user_id: str | None = None) -> CallSession:
+    """The live call for this key, or a new one. An expired call starts over
+    empty. `source` and `user_id` are logged."""
     try:
-        return _get_session(call_id), False
+        return _get_session(key)
     except ApiError as exc:
         if exc.code not in ("call_not_found", "call_expired"):
             raise
     with _create_lock:
-        session = _calls.get(call_id)
+        session = _calls.get(key)
         if session is not None:  # created by a racing request
-            return session, False
-        after_expiry = call_id in _expired_ids
-        _expired_ids.pop(call_id, None)
-        session = _calls[call_id] = CallSession()
-    logger.info("call=%s created (%s%s)", call_id, source, ", after expiry" if after_expiry else "")
-    call_log.log_event("call_created", call_id=call_id, source=source, after_expiry=after_expiry)
-    return session, True
+            return session
+        after_expiry = key in _expired_ids
+        _expired_ids.pop(key, None)
+        session = _calls[key] = CallSession()
+    logger.info("%s created (%s%s)", _who(key, user_id), source, ", after expiry" if after_expiry else "")
+    call_log.log_event("call_created", **_ids(key, user_id), source=source, after_expiry=after_expiry)
+    return session
 
 
 def evict_idle_calls() -> int:
     """Drop every idle call; returns how many. Calls with a turn in flight
     are busy, not idle, and are skipped."""
     evicted = 0
-    for call_id, session in list(_calls.items()):
+    for key, session in list(_calls.items()):
         if not session.lock.acquire(blocking=False):
             continue
         try:
-            if session.is_idle() and _calls.get(call_id) is session:
-                _expire(call_id, session)
+            if session.is_idle() and _calls.get(key) is session:
+                _expire(key, session)
                 evicted += 1
         finally:
             session.lock.release()
@@ -473,14 +496,18 @@ async def _sweep_idle_calls_forever():
             logger.exception("idle-call sweep failed")
 
 
-def _run_turn(call_id: str, session: CallSession, text: str, speaker: str, debug: bool = False) -> dict:
+def _run_turn(
+    key: CallKey, session: CallSession, text: str, speaker: str, user_id: str | None = None, debug: bool = False
+) -> dict:
     """Process one turn under the call's lock. Caller holds no lock."""
     with session.lock:
         try:
             trace = session.store.process_utterance(text, speaker=speaker)
         except Exception as exc:
-            logger.exception("call=%s process_utterance failed on %r", call_id, text)
-            call_log.log_event("turn_error", call_id=call_id, utterance=text, error=f"{type(exc).__name__}: {exc}")
+            logger.exception("%s process_utterance failed on %r", _who(key, user_id), text)
+            call_log.log_event(
+                "turn_error", **_ids(key, user_id), utterance=text, error=f"{type(exc).__name__}: {exc}"
+            )
             raise ApiError(500, "pipeline_error", f"Couldn't process that turn ({type(exc).__name__}).") from exc
         session.turn_count += 1
         session.touch()
@@ -489,21 +516,24 @@ def _run_turn(call_id: str, session: CallSession, text: str, speaker: str, debug
     fired = view["mcp"]["fired_this_turn"]
     tools = ", ".join(f"{c['tool']}({c['arguments']})" for c in fired)
     logger.info(
-        "call=%s turn=%d %r -> %s/%s intent=%s%s",
-        call_id, view["turn_index"], text,
+        "%s turn=%d %r -> %s/%s intent=%s%s",
+        _who(key, user_id), view["turn_index"], text,
         view["intent"]["decision"], view["intent"]["turn_type"], view["intent"]["selected_intent"],
         f" | MCP: {tools}" if fired else "",
     )
     raw = views.to_jsonable(trace)
-    call_log.log_event("turn", call_id=call_id, turn_index=view["turn_index"], utterance=text, view=view, raw_trace=raw)
+    call_log.log_event(
+        "turn", **_ids(key, user_id), turn_index=view["turn_index"], utterance=text, view=view, raw_trace=raw
+    )
     if debug:
         view["debug"] = raw
     return view
 
 
-def _call_state(call_id: str, session: CallSession) -> dict:
+def _call_state(key: CallKey, session: CallSession) -> dict:
     return {
-        "call_id": call_id,
+        "tenant_id": key[0],
+        "call_id": key[1],
         "turn_count": session.turn_count,
         "frames": views.frames_view(session.store),
     }
@@ -518,9 +548,10 @@ app = FastAPI(
         "deterministic slot extraction and a frame-based dialogue state machine, "
         "with LLM escalation (Gemma 3 1B via Ollama) for disambiguation, "
         "multi-intent splitting and correction/reference resolution.\n\n"
-        "Calls are identified by the PBXware call ID. Workflow: `POST /v1/calls` "
-        "(optional: the first turn creates the call) -> `POST /v1/calls/{call_id}/turns` "
-        "(repeat) -> `GET /v1/calls/{call_id}` -> `DELETE /v1/calls/{call_id}` on hangup.\n\n"
+        "A call is identified by its tenant ID plus its PBXware call ID, under "
+        "`/v1/tenants/{tenant_id}/calls/{call_id}`. Workflow: `POST .../turns` "
+        "(the first turn for a new ID starts the call; repeat) -> `GET` the call -> "
+        "`DELETE` it on hangup. Turns may carry the call agent's `user_id`, which is only logged.\n\n"
         "All errors use `{\"error\": {\"code\", \"message\"}}`. See API_DOCUMENTATION.md "
         "for the full reference, including production handover items "
         "(no auth, in-memory sessions). A call idle for "
@@ -588,66 +619,57 @@ _CONFLICT = {409: {"model": ErrorResponse, "description": "Conflicts with the cu
 # -- calls --------------------------------------------------------------------
 
 
-@app.post(
-    "/v1/calls", response_model=NewCallResponse, status_code=201, tags=["calls"],
-    responses={200: {"model": NewCallResponse, "description": "A live call with this ID already exists; returned unchanged."}, **_INVALID},
-)
-def create_call(body: NewCallRequest, response: Response):
-    """Start a call under its PBXware call ID. Safe to repeat: if the call is
-    already live it's returned unchanged with `200` (a retried call-start event
-    doesn't wipe it). Optional -- the first turn for an unknown ID also starts
-    the call. An expired ID starts over empty."""
-    _, created = _get_or_create_session(body.call_id, source="create")
-    if not created:
-        response.status_code = 200
-    return NewCallResponse(call_id=body.call_id)
-
-
-@app.get("/v1/calls/{call_id}", response_model=CallStateResponse, tags=["calls"], responses=_NOT_FOUND)
-def get_call(call_id: str):
+@app.get("/v1/tenants/{tenant_id}/calls/{call_id}", response_model=CallStateResponse, tags=["calls"], responses=_NOT_FOUND)
+def get_call(tenant_id: str, call_id: str):
     """Current state of every frame opened in this call, including each frame's
     `tool_call` and (for `search_zoho_lead`) `tool_result`."""
-    session = _get_session(call_id, touch=False)
+    key = (tenant_id, call_id)
+    session = _get_session(key, touch=False)
     with session.lock:
-        return _call_state(call_id, session)
+        return _call_state(key, session)
 
 
-@app.delete("/v1/calls/{call_id}", status_code=204, tags=["calls"], responses=_NOT_FOUND)
-def delete_call(call_id: str):
+@app.delete("/v1/tenants/{tenant_id}/calls/{call_id}", status_code=204, tags=["calls"], responses=_NOT_FOUND)
+def delete_call(tenant_id: str, call_id: str):
     """Drop a call's state. Optional: calls idle for the configured timeout are
     dropped automatically."""
-    _get_session(call_id, touch=False)
-    _calls.pop(call_id, None)
-    logger.info("call=%s deleted", call_id)
-    call_log.log_event("call_deleted", call_id=call_id)
+    key = (tenant_id, call_id)
+    _get_session(key, touch=False)
+    _calls.pop(key, None)
+    logger.info("%s deleted", _who(key))
+    call_log.log_event("call_deleted", **_ids(key))
 
 
-@app.post("/v1/calls/{call_id}/reset", response_model=NewCallResponse, tags=["calls"], responses=_NOT_FOUND)
-def reset_call(call_id: str):
-    """Wipe a call's frames and turn counter but keep the same `call_id`."""
-    _get_session(call_id)
-    _calls[call_id] = CallSession()
-    logger.info("call=%s reset", call_id)
-    call_log.log_event("call_reset", call_id=call_id)
-    return NewCallResponse(call_id=call_id)
+@app.post("/v1/tenants/{tenant_id}/calls/{call_id}/reset", response_model=NewCallResponse, tags=["calls"], responses=_NOT_FOUND)
+def reset_call(tenant_id: str, call_id: str):
+    """Wipe a call's frames and turn counter but keep the same IDs."""
+    key = (tenant_id, call_id)
+    _get_session(key)
+    _calls[key] = CallSession()
+    logger.info("%s reset", _who(key))
+    call_log.log_event("call_reset", **_ids(key))
+    return NewCallResponse(tenant_id=tenant_id, call_id=call_id)
 
 
 @app.post(
-    "/v1/calls/{call_id}/turns",
+    "/v1/tenants/{tenant_id}/calls/{call_id}/turns",
     response_model=TurnView,
     response_model_exclude_none=False,
     tags=["calls"],
     responses={**_INVALID, 500: {"model": ErrorResponse, "description": "Pipeline failure."}},
 )
 def post_turn(
+    tenant_id: TenantIdPath,
     call_id: CallIdPath,
     turn: TurnRequest,
     debug: bool = Query(False, description="Include the raw pipeline trace under `debug`."),
 ):
     """
     Feed one utterance into a call and get back a **stable** view of how it was
-    handled. The first turn for an unknown (or expired) call ID starts the call: `intent` (decision and candidates), `slots` (every
-    frame's state) and `mcp` (tool calls fired).
+    handled: `intent` (decision and candidates), `slots` (every frame's state)
+    and `mcp` (tool calls fired). The first turn for an unknown (or expired)
+    tenant/call ID pair starts the call. `user_id` (the call agent) is only
+    recorded in the logs.
 
     ### `intent.turn_type`
 
@@ -668,17 +690,18 @@ def post_turn(
     filled. Every tool is a mock except `search_zoho_lead`, which really
     executes; its response is `tool_result`.
     """
-    session, _ = _get_or_create_session(call_id, source="turn")
-    return _run_turn(call_id, session, turn.utterance, turn.speaker, debug)
+    key = (tenant_id, call_id)
+    session = _get_or_create_session(key, source="turn", user_id=turn.user_id)
+    return _run_turn(key, session, turn.utterance, turn.speaker, turn.user_id, debug)
 
 
 @app.post(
-    "/v1/calls/{call_id}/transcript",
+    "/v1/tenants/{tenant_id}/calls/{call_id}/transcript",
     response_model=TranscriptResponse,
     tags=["calls"],
     responses=_INVALID,
 )
-def post_transcript(call_id: CallIdPath, body: TranscriptRequest):
+def post_transcript(tenant_id: TenantIdPath, call_id: CallIdPath, body: TranscriptRequest):
     """Feed a whole transcript through the call, in order, as if each turn had
     been posted individually. Continues from the call's current state (use
     `/reset` first for a clean run), or starts the call if the ID is unknown.
@@ -697,11 +720,12 @@ def post_transcript(call_id: CallIdPath, body: TranscriptRequest):
             raise ApiError(422, "validation_error", f"Turn {too_long} exceeds {MAX_UTTERANCE_CHARS} characters.")
         turns = [(speaker.lower(), text) for speaker, text in parsed]
 
-    session, _ = _get_or_create_session(call_id, source="turn")
-    results = [_run_turn(call_id, session, text, speaker) for speaker, text in turns]
+    key = (tenant_id, call_id)
+    session = _get_or_create_session(key, source="turn", user_id=body.user_id)
+    results = [_run_turn(key, session, text, speaker, body.user_id) for speaker, text in turns]
     with session.lock:
         frames = views.frames_view(session.store)
-    return {"call_id": call_id, "turns": results, "frames": frames}
+    return {"tenant_id": tenant_id, "call_id": call_id, "turns": results, "frames": frames}
 
 
 # -- catalog ------------------------------------------------------------------
@@ -816,7 +840,7 @@ def delete_intent(name: str):
     waiting on slots; finish, reset or delete those calls first."""
     with catalog.lock:
         waiting = sorted(
-            call_id for call_id, session in list(_calls.items())
+            f"{tenant_id}/{call_id}" for (tenant_id, call_id), session in list(_calls.items())
             if any(f.intent == name and f.status in ("OPEN", "AWAITING_INFO") for f in session.store.frames)
         )
         if waiting:
@@ -900,12 +924,14 @@ def list_slots():
 @app.get("/v1/log", response_model=LogResponse, tags=["ops"])
 def get_log(
     limit: int = Query(200, ge=1, le=1000, description="Max records returned (the newest)."),
-    call_id: str | None = Query(None, description="Only records for this call."),
+    tenant_id: str | None = Query(None, description="Only records for this tenant."),
+    call_id: str | None = Query(None, description="Only records for this call ID."),
+    user_id: str | None = Query(None, description="Only records for this call agent."),
 ):
     """Recent structured records (calls, turns with full view + raw trace,
     overrides, errors), newest last. Backed by `logs/turns.jsonl`, which
     contains raw customer utterances -- protect this endpoint in production."""
-    records, total = call_log.read_events(limit=limit, call_id=call_id)
+    records, total = call_log.read_events(limit=limit, tenant_id=tenant_id, call_id=call_id, user_id=user_id)
     return LogResponse(records=records, total=total)
 
 
@@ -930,7 +956,7 @@ def health():
 
 
 @app.patch(
-    "/v1/calls/{call_id}/frames/{frame_id}/slots/{slot_name}",
+    "/v1/tenants/{tenant_id}/calls/{call_id}/frames/{frame_id}/slots/{slot_name}",
     response_model=TurnView,
     tags=["archived"],
     deprecated=True,
@@ -940,7 +966,7 @@ def health():
         409: {"model": ErrorResponse, "description": "The frame was REVERTED."},
     },
 )
-def override_slot(call_id: str, frame_id: int, slot_name: str, body: SlotOverrideRequest):
+def override_slot(tenant_id: str, call_id: str, frame_id: int, slot_name: str, body: SlotOverrideRequest):
     """**Archived: disabled unless `SLOT_OVERRIDE_ENABLED` is set** (otherwise
     404 `endpoint_disabled`).
 
@@ -951,7 +977,8 @@ def override_slot(call_id: str, frame_id: int, slot_name: str, body: SlotOverrid
     Counts as a turn (`turn_type` `slot_override`, speaker `agent`)."""
     if not config.SLOT_OVERRIDE_ENABLED:
         raise ApiError(404, "endpoint_disabled", "Slot override is archived and disabled on this server.")
-    session = _get_session(call_id)
+    key, user_id = (tenant_id, call_id), body.user_id
+    session = _get_session(key)
     with session.lock:
         store = session.store
         frame = store.get_frame(frame_id)
@@ -966,7 +993,7 @@ def override_slot(call_id: str, frame_id: int, slot_name: str, body: SlotOverrid
             frame, refired = store.override_slot(frame_id, slot_name, body.value)
         except ValueError as exc:
             call_log.log_event(
-                "override_rejected", call_id=call_id, frame_id=frame_id, slot=slot_name,
+                "override_rejected", **_ids(key, user_id), frame_id=frame_id, slot=slot_name,
                 value=body.value, error=str(exc),
             )
             raise ApiError(422, "invalid_slot_value", str(exc)) from exc
@@ -976,12 +1003,12 @@ def override_slot(call_id: str, frame_id: int, slot_name: str, body: SlotOverrid
         view = views.build_turn_view(views.build_override_trace(frame, slot_name, refired), store, session.turn_count)
 
     logger.info(
-        "call=%s turn=%d override %s#%d.%s -> %r%s",
-        call_id, view["turn_index"], frame.intent, frame.id, slot_name, frame.slots[slot_name],
+        "%s turn=%d override %s#%d.%s -> %r%s",
+        _who(key, user_id), view["turn_index"], frame.intent, frame.id, slot_name, frame.slots[slot_name],
         " | MCP refired" if refired else "",
     )
     call_log.log_event(
-        "slot_override", call_id=call_id, turn_index=view["turn_index"], frame_id=frame.id,
+        "slot_override", **_ids(key, user_id), turn_index=view["turn_index"], frame_id=frame.id,
         slot=slot_name, value=views.to_jsonable(frame.slots[slot_name]), refired=refired, view=view,
     )
     return view

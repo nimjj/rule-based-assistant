@@ -84,6 +84,7 @@ class clock:
     now = 1000.0
 
 
+TENANT = "acme"
 _pbx_ids = itertools.count(1)
 
 
@@ -93,15 +94,19 @@ def pbx_id():
 
 
 def new_call(client):
+    """A fresh call ID. Nothing exists server-side until its first turn."""
+    return pbx_id()
+
+
+def live_call(client):
+    """A call started by its first turn (track_order, awaiting order_id)."""
     cid = pbx_id()
-    r = client.post("/v1/calls", json={"call_id": cid})
-    assert r.status_code == 201, r.text
-    assert r.json() == {"call_id": cid}
+    assert turn(client, cid, "track my order").status_code == 200
     return cid
 
 
 def turn(client, call_id, utterance, speaker="customer", **params):
-    return client.post(f"/v1/calls/{call_id}/turns", json={"utterance": utterance, "speaker": speaker}, params=params)
+    return client.post(f"/v1/tenants/{TENANT}/calls/{call_id}/turns", json={"utterance": utterance, "speaker": speaker}, params=params)
 
 
 def assert_error(r, status, code):
@@ -115,15 +120,15 @@ def assert_error(r, status, code):
 def test_lifecycle_get_reset_delete(client):
     cid = new_call(client)
     turn(client, cid, "track my order")
-    state = client.get(f"/v1/calls/{cid}").json()
+    state = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()
     assert state["turn_count"] == 1 and state["frames"][0]["intent"] == "track_order"
 
-    assert client.post(f"/v1/calls/{cid}/reset").json() == {"call_id": cid}
-    state = client.get(f"/v1/calls/{cid}").json()
+    assert client.post(f"/v1/tenants/{TENANT}/calls/{cid}/reset").json() == {"tenant_id": TENANT, "call_id": cid}
+    state = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()
     assert state["turn_count"] == 0 and state["frames"] == []
 
-    assert client.delete(f"/v1/calls/{cid}").status_code == 204
-    assert_error(client.get(f"/v1/calls/{cid}"), 404, "call_not_found")
+    assert client.delete(f"/v1/tenants/{TENANT}/calls/{cid}").status_code == 204
+    assert_error(client.get(f"/v1/tenants/{TENANT}/calls/{cid}"), 404, "call_not_found")
 
 
 # -- idle expiry --------------------------------------------------------------
@@ -134,12 +139,12 @@ def test_lifecycle_get_reset_delete(client):
 def test_idle_call_expires_on_access(client, method, path):
     import server
 
-    cid = new_call(client)
+    cid = live_call(client)
     clock.now += 601
-    assert_error(getattr(client, method)(f"/v1/calls/{cid}{path}"), 404, "call_expired")
+    assert_error(getattr(client, method)(f"/v1/tenants/{TENANT}/calls/{cid}{path}"), 404, "call_expired")
     # Gone from memory, and stays call_expired on later requests.
-    assert cid not in server._calls
-    assert_error(client.get(f"/v1/calls/{cid}"), 404, "call_expired")
+    assert (TENANT, cid) not in server._calls
+    assert_error(client.get(f"/v1/tenants/{TENANT}/calls/{cid}"), 404, "call_expired")
 
 
 def test_active_call_outlives_timeout(client):
@@ -148,37 +153,37 @@ def test_active_call_outlives_timeout(client):
         clock.now += 500
         assert turn(client, cid, "track my order").status_code == 200
     clock.now += 500
-    assert client.post(f"/v1/calls/{cid}/reset").status_code == 200
+    assert client.post(f"/v1/tenants/{TENANT}/calls/{cid}/reset").status_code == 200
     clock.now += 500
-    assert client.get(f"/v1/calls/{cid}").status_code == 200
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").status_code == 200
 
 
 def test_get_does_not_keep_call_alive(client):
-    cid = new_call(client)
+    cid = live_call(client)
     clock.now += 400
-    assert client.get(f"/v1/calls/{cid}").status_code == 200
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").status_code == 200
     clock.now += 201
-    assert_error(client.get(f"/v1/calls/{cid}"), 404, "call_expired")
+    assert_error(client.get(f"/v1/tenants/{TENANT}/calls/{cid}"), 404, "call_expired")
 
 
 def test_sweep_evicts_only_idle_calls(client):
     import server
 
-    old, fresh = new_call(client), new_call(client)
+    old, fresh = live_call(client), live_call(client)
     clock.now += 500
     turn(client, fresh, "track my order")
     clock.now += 101
     assert server.evict_idle_calls() == 1
-    assert list(server._calls) == [fresh]
-    assert_error(client.get(f"/v1/calls/{old}"), 404, "call_expired")
+    assert list(server._calls) == [(TENANT, fresh)]
+    assert_error(client.get(f"/v1/tenants/{TENANT}/calls/{old}"), 404, "call_expired")
 
 
 def test_sweep_skips_call_with_turn_in_flight(client):
     import server
 
-    cid = new_call(client)
+    cid = live_call(client)
     clock.now += 601
-    with server._calls[cid].lock:
+    with server._calls[(TENANT, cid)].lock:
         assert server.evict_idle_calls() == 0
     assert server.evict_idle_calls() == 1
 
@@ -187,57 +192,66 @@ def test_zero_timeout_disables_expiry(client, monkeypatch):
     import server
 
     monkeypatch.setattr(config, "CALL_IDLE_TIMEOUT_SECONDS", 0)
-    cid = new_call(client)
+    cid = live_call(client)
     clock.now += 10**6
     assert server.evict_idle_calls() == 0
-    assert client.get(f"/v1/calls/{cid}").status_code == 200
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").status_code == 200
 
 
 @pytest.mark.parametrize("method,path", [
-    ("get", "/v1/calls/nope"), ("delete", "/v1/calls/nope"), ("post", "/v1/calls/nope/reset"),
+    ("get", f"/v1/tenants/{TENANT}/calls/nope"), ("delete", f"/v1/tenants/{TENANT}/calls/nope"),
+    ("post", f"/v1/tenants/{TENANT}/calls/nope/reset"),
 ])
 def test_unknown_call_404(client, method, path):
     assert_error(getattr(client, method)(path), 404, "call_not_found")
 
 
 def test_unknown_call_on_override(client, slot_override):
-    r = client.patch("/v1/calls/nope/frames/1/slots/order_id", json={"value": "ORD-1234"})
+    r = client.patch(f"/v1/tenants/{TENANT}/calls/nope/frames/1/slots/order_id", json={"value": "ORD-1234"})
     assert_error(r, 404, "call_not_found")
 
 
 # -- PBXware call IDs -----------------------------------------------------------
 
-def test_create_is_idempotent_and_keeps_state(client):
-    cid = new_call(client)
-    turn(client, cid, "track my order")
-    r = client.post("/v1/calls", json={"call_id": cid})
-    assert r.status_code == 200 and r.json() == {"call_id": cid}
-    assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 1
-
-
-@pytest.mark.parametrize("body", [{}, {"call_id": ""}, {"call_id": "has space"}, {"call_id": "a/b"},
-                                  {"call_id": "x" * 129}, {"call_id": 12345}])
-def test_create_requires_valid_call_id(client, body):
-    import server
-
-    assert_error(client.post("/v1/calls", json=body), 422, "validation_error")
-    assert server._calls == {}
+def test_create_endpoint_is_gone(client):
+    assert_error(client.post("/v1/calls", json={"call_id": pbx_id()}), 404, "not_found")
 
 
 @pytest.mark.parametrize("cid", ["1727690000.12345", "7c9e6679-7425-40de-944b-e07fc1f90ae7", "pbx:A_1"])
 def test_accepted_call_id_formats(client, cid):
-    assert client.post("/v1/calls", json={"call_id": cid}).status_code == 201
     assert turn(client, cid, "track my order").status_code == 200
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["call_id"] == cid
 
 
 def test_first_turn_starts_the_call(client):
     cid = pbx_id()
     v = turn(client, cid, "track my order")
     assert v.status_code == 200 and v.json()["turn_index"] == 1
-    assert client.get(f"/v1/calls/{cid}").json()["frames"][0]["intent"] == "track_order"
-    # The later create (e.g. a late call-start event) doesn't wipe it.
-    assert client.post("/v1/calls", json={"call_id": cid}).status_code == 200
-    assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 1
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["intent"] == "track_order"
+    # Later turns continue the same call.
+    assert turn(client, cid, "ORD-12345").json()["turn_index"] == 2
+
+
+def test_same_call_id_under_two_tenants_is_two_calls(client):
+    cid = pbx_id()
+    turn(client, cid, "track my order")
+    other = client.post(f"/v1/tenants/globex/calls/{cid}/turns", json={"utterance": "cancel my order"})
+    assert other.json()["turn_index"] == 1
+    a = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()
+    b = client.get(f"/v1/tenants/globex/calls/{cid}").json()
+    assert (a["tenant_id"], a["frames"][0]["intent"]) == (TENANT, "track_order")
+    assert (b["tenant_id"], b["frames"][0]["intent"]) == ("globex", "cancel_order")
+    assert client.delete(f"/v1/tenants/globex/calls/{cid}").status_code == 204
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").status_code == 200
+
+
+@pytest.mark.parametrize("tenant", ["x" * 129, "has space"])
+def test_invalid_tenant_id_creates_nothing(client, tenant):
+    import server
+
+    r = client.post(f"/v1/tenants/{tenant}/calls/{pbx_id()}/turns", json={"utterance": "hi"})
+    assert_error(r, 422, "validation_error")
+    assert server._calls == {}
 
 
 def test_invalid_call_id_on_turn_creates_nothing(client):
@@ -251,23 +265,18 @@ def test_transcript_starts_the_call_only_if_valid(client):
     import server
 
     cid = pbx_id()
-    bad = client.post(f"/v1/calls/{cid}/transcript", json={"transcript": "no tagged lines"})
+    bad = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/transcript", json={"transcript": "no tagged lines"})
     assert_error(bad, 422, "validation_error")
-    assert cid not in server._calls
-    r = client.post(f"/v1/calls/{cid}/transcript", json={"transcript": "Customer: track my order\nCustomer: ORD-12345"})
+    assert (TENANT, cid) not in server._calls
+    r = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/transcript", json={"transcript": "Customer: track my order\nCustomer: ORD-12345"})
     assert r.status_code == 200 and r.json()["frames"][0]["status"] == "FIRED"
 
 
-def test_expired_call_starts_over_on_turn_or_create(client):
-    cid = new_call(client)
-    turn(client, cid, "track my order")
+def test_expired_call_starts_over_on_turn(client):
+    cid = live_call(client)
     clock.now += 601
     v = turn(client, cid, "cancel my order").json()
     assert v["turn_index"] == 1 and [f["intent"] for f in v["slots"]["frames"]] == ["cancel_order"]
-
-    clock.now += 601
-    assert client.post("/v1/calls", json={"call_id": cid}).status_code == 201
-    assert client.get(f"/v1/calls/{cid}").json() == {"call_id": cid, "turn_count": 0, "frames": []}
 
 
 def test_unknown_route_uses_error_shape(client):
@@ -325,7 +334,7 @@ def test_escalated_and_multi_intent_and_unknown(client):
 def test_new_date_slot_is_flattened_to_resolved_string(client):
     cid = new_call(client)
     turn(client, cid, "reschedule ORD-12345 to 2030-01-15")
-    frame = client.get(f"/v1/calls/{cid}").json()["frames"][0]
+    frame = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]
     assert frame["status"] == "FIRED"
     assert frame["slots"]["new_date"] == "2030-01-15T00:00:00"  # resolved ISO-8601, not the {"text","date"} dict
 
@@ -336,7 +345,7 @@ def test_zoho_tool_result_exposed(client):
     frame = v["slots"]["frames"][0]
     assert frame["tool_call"]["tool"] == "search_zoho_lead"
     assert frame["tool_result"] == {"data": [{"Email": "jane@example.com"}]}
-    assert client.get(f"/v1/calls/{cid}").json()["frames"][0]["tool_result"] == frame["tool_result"]
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["tool_result"] == frame["tool_result"]
 
 
 def test_zoho_failure_is_a_tool_error_not_a_500(client, monkeypatch):
@@ -357,7 +366,7 @@ def test_zoho_failure_is_a_tool_error_not_a_500(client, monkeypatch):
 ])
 def test_turn_validation(client, payload):
     cid = new_call(client)
-    r = client.post(f"/v1/calls/{cid}/turns", json=payload)
+    r = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/turns", json=payload)
     assert_error(r, 422, "validation_error")
     assert r.json()["error"]["details"]
 
@@ -371,7 +380,7 @@ def test_pipeline_exception_is_500_with_error_shape(client, monkeypatch):
     assert_error(r, 500, "pipeline_error")
     assert "exploded" not in r.text  # internals aren't leaked
     # A failed turn doesn't consume a turn index.
-    assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 0
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["turn_count"] == 0
 
 
 # -- slot override (archived) ----------------------------------------------------
@@ -379,15 +388,15 @@ def test_pipeline_exception_is_500_with_error_shape(client, monkeypatch):
 def test_override_disabled_by_default(client, demo_ui):
     cid = new_call(client)
     turn(client, cid, "track my order")
-    r = client.patch(f"/v1/calls/{cid}/frames/1/slots/order_id", json={"value": "ORD-22222"})
+    r = client.patch(f"/v1/tenants/{TENANT}/calls/{cid}/frames/1/slots/order_id", json={"value": "ORD-22222"})
     assert_error(r, 404, "endpoint_disabled")
-    assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 1
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["turn_count"] == 1
     assert client.get("/demo/config").json() == {"slot_override_enabled": False}
 
 
 def test_override_listed_as_archived(client):
     spec = client.get("/openapi.json").json()
-    op = spec["paths"]["/v1/calls/{call_id}/frames/{frame_id}/slots/{slot_name}"]["patch"]
+    op = spec["paths"]["/v1/tenants/{tenant_id}/calls/{call_id}/frames/{frame_id}/slots/{slot_name}"]["patch"]
     assert op["tags"] == ["archived"] and op["deprecated"] is True
     assert spec["tags"][-1]["name"] == "archived"
 
@@ -396,7 +405,7 @@ def test_override_refires_tool_with_corrected_value(client, slot_override):
     cid = new_call(client)
     turn(client, cid, "track my order")
     turn(client, cid, "ORD-11111")
-    r = client.patch(f"/v1/calls/{cid}/frames/1/slots/order_id", json={"value": "ORD-22222"})
+    r = client.patch(f"/v1/tenants/{TENANT}/calls/{cid}/frames/1/slots/order_id", json={"value": "ORD-22222"})
     assert r.status_code == 200
     v = r.json()
     assert v["intent"]["turn_type"] == "slot_override" and v["speaker"] == "agent"
@@ -410,13 +419,13 @@ def test_override_refires_tool_with_corrected_value(client, slot_override):
 def test_override_errors(client, slot_override):
     cid = new_call(client)
     turn(client, cid, "track my order")
-    url = f"/v1/calls/{cid}/frames/1/slots"
-    assert_error(client.patch(f"/v1/calls/{cid}/frames/99/slots/order_id", json={"value": "ORD-1234"}), 404, "frame_not_found")
+    url = f"/v1/tenants/{TENANT}/calls/{cid}/frames/1/slots"
+    assert_error(client.patch(f"/v1/tenants/{TENANT}/calls/{cid}/frames/99/slots/order_id", json={"value": "ORD-1234"}), 404, "frame_not_found")
     assert_error(client.patch(f"{url}/email", json={"value": "a@b.co"}), 422, "invalid_slot")
     assert_error(client.patch(f"{url}/order_id", json={"value": "no id here"}), 422, "invalid_slot_value")
     assert_error(client.patch(f"{url}/order_id", json={"value": ""}), 422, "validation_error")
     # Nothing above changed anything or consumed a turn index.
-    assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 1
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["turn_count"] == 1
 
 
 def test_override_on_reverted_frame_is_409(client, slot_override):
@@ -426,7 +435,7 @@ def test_override_on_reverted_frame_is_409(client, slot_override):
     # Complete the frame first, then revert it with a correction.
     turn(client, cid, "ORD-12345")
     assert turn(client, cid, "actually never mind").json()["intent"]["turn_type"] == "correction"
-    r = client.patch(f"/v1/calls/{cid}/frames/1/slots/order_id", json={"value": "ORD-99999"})
+    r = client.patch(f"/v1/tenants/{TENANT}/calls/{cid}/frames/1/slots/order_id", json={"value": "ORD-99999"})
     assert_error(r, 409, "frame_reverted")
 
 
@@ -435,7 +444,7 @@ def test_override_on_reverted_frame_is_409(client, slot_override):
 def test_transcript_text(client):
     cid = new_call(client)
     text = "Customer: please track my order\nAgent: sure, what is the order number?\nCustomer: ORD-99213\nnoise line"
-    r = client.post(f"/v1/calls/{cid}/transcript", json={"transcript": text})
+    r = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/transcript", json={"transcript": text})
     assert r.status_code == 200
     body = r.json()
     assert [t["speaker"] for t in body["turns"]] == ["customer", "agent", "customer"]
@@ -445,7 +454,7 @@ def test_transcript_text(client):
 
 def test_transcript_turns_list(client):
     cid = new_call(client)
-    r = client.post(f"/v1/calls/{cid}/transcript", json={"turns": [
+    r = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/transcript", json={"turns": [
         {"utterance": "track my order"}, {"utterance": "ORD-99213", "speaker": "customer"},
     ]})
     assert r.status_code == 200 and r.json()["frames"][0]["status"] == "FIRED"
@@ -457,9 +466,9 @@ def test_transcript_turns_list(client):
     {"transcript": "Customer: " + "x" * 2001},
 ])
 def test_transcript_validation_processes_nothing(client, payload):
-    cid = new_call(client)
-    assert_error(client.post(f"/v1/calls/{cid}/transcript", json=payload), 422, "validation_error")
-    assert client.get(f"/v1/calls/{cid}").json()["turn_count"] == 0
+    cid = live_call(client)
+    assert_error(client.post(f"/v1/tenants/{TENANT}/calls/{cid}/transcript", json=payload), 422, "validation_error")
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["turn_count"] == 1
 
 
 # -- catalog, log, health, demo -------------------------------------------------
@@ -532,7 +541,7 @@ def test_labels_on_turn_frame_and_call_views(client):
     assert v["mcp"]["all_calls"][0]["intent_label"] == "Track Order"
     assert v["mcp"]["all_calls"][0]["tool_label"] == "Get Order Status"
 
-    state = client.get(f"/v1/calls/{cid}").json()
+    state = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()
     assert state["frames"][0]["intent_label"] == "Track Order"
 
     blocked = turn(client, cid, "track and cancel both").json()
@@ -575,7 +584,7 @@ def test_label_edit_shows_on_live_call(client):
     body = {"label": "Order Tracking", "exemplars": spec["exemplars"],
             "required_slots": spec["required_slots"], "tool": spec["tool"]}
     assert client.put("/v1/intents/track_order", json=body).status_code == 200
-    assert client.get(f"/v1/calls/{cid}").json()["frames"][0]["intent_label"] == "Order Tracking"
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["intent_label"] == "Order Tracking"
 
 
 # -- renames ------------------------------------------------------------------
@@ -597,7 +606,7 @@ def test_intent_rename_moves_spec_mapping_and_live_frames(client, monkeypatch):
     assert client.get("/v1/tools/get_order_status").json()["intents"] == ["order_tracking"]
 
     # The waiting frame carries on under the new name and still fires.
-    frame = client.get(f"/v1/calls/{cid}").json()["frames"][0]
+    frame = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]
     assert frame["intent"] == "order_tracking" and frame["status"] == "AWAITING_INFO"
     monkeypatch.setattr(state_store, "retrieve", lambda text, top_k=3: [("order_tracking", 0.1)])
     v = turn(client, cid, "ORD-12345").json()
@@ -620,7 +629,7 @@ def test_tool_rename_repoints_intents_and_live_calls(client):
     assert client.get("/v1/intents/track_order").json()["tool"] == "get_status_order"
     assert_error(client.get("/v1/tools/get_order_status"), 404, "tool_not_found")
 
-    frame = client.get(f"/v1/calls/{cid}").json()["frames"][0]
+    frame = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]
     assert frame["tool_call"]["tool"] == "get_status_order"
 
     cid2 = new_call(client)
@@ -699,7 +708,7 @@ def test_intent_delete_refused_while_frame_waiting(client):
     assert_error(client.delete("/v1/intents/track_order"), 409, "intent_in_use")
     turn(client, cid, "ORD-12345")  # frame fires -> no longer waiting
     assert client.delete("/v1/intents/track_order").status_code == 204
-    assert client.get(f"/v1/calls/{cid}").json()["frames"][0]["required"] == []
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["required"] == []
 
 
 def test_tool_crud_and_mapping(client, monkeypatch):
@@ -753,6 +762,34 @@ def test_log_records_and_filters(client):
     assert_error(client.get("/v1/log", params={"limit": 0}), 422, "validation_error")
 
 
+def test_log_records_carry_tenant_call_and_user_ids(client):
+    cid = pbx_id()
+    client.post(f"/v1/tenants/{TENANT}/calls/{cid}/turns", json={"utterance": "track my order", "user_id": "agent-7"})
+    client.post(f"/v1/tenants/{TENANT}/calls/{cid}/turns", json={"utterance": "ORD-12345", "user_id": "agent-9"})
+    client.post(f"/v1/tenants/globex/calls/{cid}/transcript",
+                json={"transcript": "Customer: cancel my order", "user_id": "agent-7"})
+    client.post(f"/v1/tenants/{TENANT}/calls/{cid}/reset")
+
+    recs = client.get("/v1/log", params={"tenant_id": TENANT}).json()["records"]
+    assert [(r["event"], r.get("user_id")) for r in recs] == [
+        ("call_created", "agent-7"), ("turn", "agent-7"), ("turn", "agent-9"), ("call_reset", None),
+    ]
+    assert all(r["tenant_id"] == TENANT and r["call_id"] == cid for r in recs)
+
+    by_user = client.get("/v1/log", params={"user_id": "agent-7"}).json()["records"]
+    assert [(r["tenant_id"], r["event"]) for r in by_user] == [
+        (TENANT, "call_created"), (TENANT, "turn"), ("globex", "call_created"), ("globex", "turn"),
+    ]
+    both = client.get("/v1/log", params={"tenant_id": "globex", "call_id": cid}).json()
+    assert both["total"] == 2
+
+
+@pytest.mark.parametrize("user_id", ["", "   ", "x" * 129])
+def test_invalid_user_id_is_rejected(client, user_id):
+    r = client.post(f"/v1/tenants/{TENANT}/calls/{pbx_id()}/turns", json={"utterance": "hi", "user_id": user_id})
+    assert_error(r, 422, "validation_error")
+
+
 def test_health_ok_and_degraded(client, monkeypatch):
     import llm
 
@@ -780,8 +817,9 @@ def test_demo_page_and_assets_and_no_legacy_routes(client, demo_ui):
 
 def test_openapi_documents_all_v1_routes(client):
     paths = client.get("/openapi.json").json()["paths"]
-    for p in ["/v1/calls", "/v1/calls/{call_id}", "/v1/calls/{call_id}/turns", "/v1/calls/{call_id}/transcript",
-              "/v1/calls/{call_id}/reset", "/v1/calls/{call_id}/frames/{frame_id}/slots/{slot_name}",
+    assert "/v1/calls" not in paths
+    for p in ["/v1/tenants/{tenant_id}/calls/{call_id}", "/v1/tenants/{tenant_id}/calls/{call_id}/turns", "/v1/tenants/{tenant_id}/calls/{call_id}/transcript",
+              "/v1/tenants/{tenant_id}/calls/{call_id}/reset", "/v1/tenants/{tenant_id}/calls/{call_id}/frames/{frame_id}/slots/{slot_name}",
               "/v1/intents", "/v1/intents/{name}", "/v1/tools", "/v1/tools/{name}", "/v1/slots",
               "/v1/log", "/health"]:
         assert p in paths, p

@@ -52,33 +52,32 @@ function setBusy(busy) {
 
 // -- actions --------------------------------------------------------------
 
-// In production the call ID comes from PBXware; the demo makes up its own.
+// In production the tenant, call and agent IDs come from PBXware; the demo
+// uses fixed tenant/agent IDs and makes up its own call IDs.
+const DEMO_TENANT_ID = "demo";
+const DEMO_USER_ID = "demo-agent";
+
+function callPath(suffix = "") {
+  return `/v1/tenants/${DEMO_TENANT_ID}/calls/${encodeURIComponent(state.callId)}${suffix}`;
+}
+
 function demoCallId() {
   return "demo-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 }
 
-async function createCall() {
-  const { call_id } = await api("/v1/calls", {
-    method: "POST",
-    body: JSON.stringify({ call_id: demoCallId() }),
-  });
-  state.callId = call_id;
+// No server round trip: the call starts on the server with its first turn.
+function createCall() {
+  state.callId = demoCallId();
   state.turns = [];
   state.selected = -1;
-  $("#call-id").textContent = call_id;
+  $("#tenant-id").textContent = DEMO_TENANT_ID;
+  $("#call-id").textContent = state.callId;
 }
 
-async function newCall() {
-  setBusy(true);
-  try {
-    await createCall();
-  } catch (err) {
-    flash("Couldn't start a call: " + err.message);
-  } finally {
-    setBusy(false);
-    render();
-    $("#utterance").focus();
-  }
+function newCall() {
+  createCall();
+  render();
+  $("#utterance").focus();
 }
 
 function setSpeaker(speaker) {
@@ -97,9 +96,9 @@ async function sendTurn() {
   const text = stripped ? stripped[2].trim() : raw;
   setBusy(true);
   try {
-    const view = await api(`/v1/calls/${state.callId}/turns`, {
+    const view = await api(callPath("/turns"), {
       method: "POST",
-      body: JSON.stringify({ utterance: text, speaker: state.speaker.toLowerCase() }),
+      body: JSON.stringify({ utterance: text, speaker: state.speaker.toLowerCase(), user_id: DEMO_USER_ID }),
     });
     state.turns.push(view);
     state.selected = state.turns.length - 1;
@@ -118,7 +117,7 @@ async function sendTurn() {
 // Archived: only wired up when /demo/config reports slot_override_enabled.
 // Inline edit on any slot row in panel 2: click the pencil, type the
 // corrected value, Save. Backed by demo_web.py's
-// PATCH /v1/calls/{id}/frames/{frame_id}/slots/{slot_name}, which re-runs
+// PATCH /v1/tenants/{tenant}/calls/{id}/frames/{frame_id}/slots/{slot_name}, which re-runs
 // the same extractor a normal turn would use and, once the frame's required
 // slots are all filled, rebuilds and redispatches its MCP tool call with the
 // corrected data. The response is a normal turn "view", so it's handled
@@ -129,8 +128,8 @@ async function submitSlotOverride(frameId, slotName, value) {
   setBusy(true);
   try {
     const view = await api(
-      `/v1/calls/${state.callId}/frames/${frameId}/slots/${encodeURIComponent(slotName)}`,
-      { method: "PATCH", body: JSON.stringify({ value }) },
+      callPath(`/frames/${frameId}/slots/${encodeURIComponent(slotName)}`),
+      { method: "PATCH", body: JSON.stringify({ value, user_id: DEMO_USER_ID }) },
     );
     state.turns.push(view);
     state.selected = state.turns.length - 1;
@@ -225,7 +224,7 @@ async function playTranscript(turns) {
   state.playing = true;
   setPlaybackControls(true);
   try {
-    await createCall();
+    createCall();
     render();
     for (const { speaker, utterance } of turns) {
       if (!state.playing) break;
@@ -234,9 +233,9 @@ async function playTranscript(turns) {
 
       let view;
       try {
-        view = await api(`/v1/calls/${state.callId}/turns`, {
+        view = await api(callPath("/turns"), {
           method: "POST",
-          body: JSON.stringify({ utterance, speaker: speaker.toLowerCase() }),
+          body: JSON.stringify({ utterance, speaker: speaker.toLowerCase(), user_id: DEMO_USER_ID }),
         });
       } catch (err) {
         flash("Playback stopped: " + err.message);
