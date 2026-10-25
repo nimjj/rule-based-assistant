@@ -271,4 +271,37 @@ INTENTS = {
         ],
         "required_slots": ["email"],
     },
+    "lookup_by_phone": {
+        "label": "Phone Lookup",
+        "exemplars": [
+            "Can you look me up by my phone number",
+            "Can you find my account with my phone number",
+            "My phone number is 555-555-5555, can you pull me up",
+            "Search for me using the number I'm calling from",
+        ],
+        "required_slots": ["phone"],
+    },
+    "lookup_company_account": {
+        "label": "Company Account Lookup",
+        "exemplars": [
+            "I'm calling from Acme Corp, can you pull up our company account",
+            "Can you look up the account for my company",
+            "I'm calling on behalf of my company",
+            "Do you have our business on file",
+            "I'm calling from our company, can you pull up our account",
+            "Can you pull up our business account",
+        ],
+        "required_slots": ["company_name"],
+    },
+    "check_deal_status": {
+        "label": "Deal Status",
+        "exemplars": [
+            "What's the status of our deal",
+            "Where are we on the deal",
+            "Has the deal closed yet",
+            "What stage is our deal in",
+            "How much is the deal worth",
+        ],
+        "required_slots": ["deal_name"],
+    },
 }

@@ -13,12 +13,13 @@
 
 from dataclasses import dataclass, field
 
-import config
-import llm
-import mcp_tools
-from embeddings import retrieve
-from intents import INTENTS
-from slots import SLOT_EXTRACTORS
+from ciap import config
+from ciap.pipeline import llm
+from ciap.pipeline import responder
+from ciap.integrations import mcp_tools
+from ciap.pipeline.embeddings import retrieve
+from ciap.pipeline.intents import INTENTS
+from ciap.pipeline.slots import SLOT_EXTRACTORS
 
 
 @dataclass
@@ -30,6 +31,8 @@ class Frame:
     missing_slots: list = field(default_factory=list)
     tool_call: dict = None  # set once status becomes FIRED - see mcp_tools.build_tool_call
     tool_result: dict = None  # set for tool_calls actually dispatched - see mcp_tools.dispatch_tool_call
+    answer: dict = None  # the agent-facing reading of tool_result - see responder.compose_answer
+    utterances: list = field(default_factory=list)  # {"speaker", "text"} of the turns that opened/filled it
     initiated_by: str = "customer"  # "customer" or "agent" -- who opened this frame
 
 
@@ -49,6 +52,11 @@ class ConversationStateStore:
         self._next_id += 1
         self.frames.append(frame)
         return frame
+
+    def _fire(self, frame):
+        frame.tool_call = mcp_tools.build_tool_call(frame.intent, frame.slots)
+        frame.tool_result = mcp_tools.dispatch_tool_call(frame.tool_call)
+        frame.answer = responder.compose_answer(frame)
 
     def _pending_frame(self):
         for frame in reversed(self.frames):
@@ -94,15 +102,14 @@ class ConversationStateStore:
 
         refired = False
         if not frame.missing_slots:
-            frame.tool_call = mcp_tools.build_tool_call(frame.intent, frame.slots)
-            frame.tool_result = mcp_tools.dispatch_tool_call(frame.tool_call)
+            self._fire(frame)
             frame.status = "FIRED"
             refired = True
         else:
             frame.status = "AWAITING_INFO"
         return frame, refired
 
-    def _fill_slots(self, frame, utterance):
+    def _fill_slots(self, frame, utterance, speaker="customer"):
         required = INTENTS[frame.intent]["required_slots"]
         filled_now = []
         for slot_name in required:
@@ -115,16 +122,19 @@ class ConversationStateStore:
             if value:
                 frame.slots[slot_name] = value
                 filled_now.append(slot_name)
+        # What was asked, for responder.py: the turn that opened the frame
+        # plus every turn that filled one of its slots.
+        if filled_now or not frame.utterances:
+            frame.utterances.append({"speaker": speaker, "text": utterance})
         frame.missing_slots = [s for s in required if s not in frame.slots]
         frame.status = "FIRED" if not frame.missing_slots else "AWAITING_INFO"
         if frame.status == "FIRED" and frame.tool_call is None:
-            frame.tool_call = mcp_tools.build_tool_call(frame.intent, frame.slots)
-            frame.tool_result = mcp_tools.dispatch_tool_call(frame.tool_call)
+            self._fire(frame)
         return filled_now
 
     def _open_and_fill(self, intent, utterance, initiated_by="customer"):
         frame = self._new_frame(intent, initiated_by=initiated_by)
-        filled = self._fill_slots(frame, utterance)
+        filled = self._fill_slots(frame, utterance, speaker=initiated_by)
         return frame, filled
 
     def _fired_frame_for_intent(self, intent):
@@ -213,7 +223,7 @@ class ConversationStateStore:
             or top_intent == pending.intent
             or multi_intent
         ):
-            filled = self._fill_slots(pending, utterance)
+            filled = self._fill_slots(pending, utterance, speaker=speaker)
             if filled:
                 trace["turn_type"] = "slot_fill"
                 trace["frame"] = pending.id

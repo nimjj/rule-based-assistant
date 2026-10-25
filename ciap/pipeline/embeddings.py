@@ -21,8 +21,8 @@ import threading
 
 from sentence_transformers import SentenceTransformer
 
-import config
-from intents import INTENTS
+from ciap import config
+from ciap.pipeline.intents import INTENTS
 
 MODEL_NAME = config.EMBEDDING_MODEL_NAME  # small, fast, CPU-friendly
 

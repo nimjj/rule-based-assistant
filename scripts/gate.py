@@ -6,8 +6,8 @@
 # Mid-confidence disambiguation (LLM-assisted) is out of scope here — that's
 # Stage 2, Intent Classification.
 
-from embeddings import retrieve
-from config import HIGH_CONFIDENCE, RETRIEVAL_TOP_K
+from ciap.pipeline.embeddings import retrieve
+from ciap.config import HIGH_CONFIDENCE, RETRIEVAL_TOP_K
 
 
 def classify(utterance, top_k=RETRIEVAL_TOP_K):

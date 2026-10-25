@@ -1,6 +1,6 @@
 # Pre-flight: run before starting the server (or a demo session) -- NOT live.
 #
-#     python tools/demo_check.py
+#     python scripts/demo_check.py
 #
 # Verifies every dependency the demo touches and pays the one-time costs up
 # front (embedding model load/download, Ollama warm-up) so the first live
@@ -25,7 +25,7 @@ def check_imports():
 def check_embedding_model():
     # Loads the model and builds the exemplar index. If the weights aren't
     # cached this pulls from HuggingFace -- exactly what must not happen live.
-    from embeddings import retrieve
+    from ciap.pipeline.embeddings import retrieve
     start = time.perf_counter()
     retrieve("warm up the embedding index")
     return time.perf_counter() - start
@@ -33,7 +33,7 @@ def check_embedding_model():
 
 def check_ollama():
     import ollama
-    from llm import MODEL_NAME
+    from ciap.pipeline.llm import MODEL_NAME
 
     client = ollama.Client()
     resp = client.list()
@@ -60,7 +60,7 @@ def check_ollama():
 
 def check_pipeline_end_to_end():
     # Intent -> slot -> MCP call, the spine of the demo.
-    from state_store import ConversationStateStore
+    from ciap.pipeline.state_store import ConversationStateStore
 
     store = ConversationStateStore()
     store.process_utterance("Where is my order")
@@ -96,7 +96,7 @@ def main():
         sys.exit(1)
 
     print("\nAll checks passed.")
-    print("Start:  uvicorn server:app")
+    print("Start:  uvicorn ciap.api.server:app")
     print("Demo:   http://127.0.0.1:8000/demo  (needs DEMO_UI_ENABLED=1)")
 
 

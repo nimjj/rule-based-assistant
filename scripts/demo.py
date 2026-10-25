@@ -1,10 +1,10 @@
 # Stage 3 demo: the conversational state store, on top of the Stage 1 gate
 # and Stage 2 slot extraction.
 #
-#   python tools/demo.py call                  # replay every tools/samples/*.txt as a simulated live call
-#   python tools/demo.py call "easy (1).txt"   # replay just one sample
-#   python tools/demo.py live                  # type turns yourself, multi-turn, until Ctrl+C
-#   python tools/demo.py test                  # score intent_test_dataset.xlsx (intent only, single-turn)
+#   python scripts/demo.py call                  # replay every scripts/samples/*.txt as a simulated live call
+#   python scripts/demo.py call "easy (1).txt"   # replay just one sample
+#   python scripts/demo.py live                  # type turns yourself, multi-turn, until Ctrl+C
+#   python scripts/demo.py test                  # score intent_test_dataset.xlsx (intent only, single-turn)
 
 import argparse
 import glob
@@ -16,8 +16,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gate import classify  # noqa: E402
-from state_store import ConversationStateStore  # noqa: E402
-from transcripts import parse_turn, parse_turns  # noqa: E402
+from ciap.pipeline.state_store import ConversationStateStore  # noqa: E402
+from ciap.pipeline.transcripts import parse_turn, parse_turns  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -110,7 +110,7 @@ def run_calls(names):
     else:
         paths = sorted(glob.glob(os.path.join(SAMPLES_DIR, "*.txt")))
     if not paths:
-        print("No sample transcripts found (expected tools/samples/*.txt).")
+        print("No sample transcripts found (expected scripts/samples/*.txt).")
         return
     for path in paths:
         run_call(path)
@@ -196,7 +196,7 @@ def main():
     )
     parser.add_argument(
         "samples", nargs="*",
-        help="'call' mode only: specific sample file(s) under tools/samples/ (default: all of them)",
+        help="'call' mode only: specific sample file(s) under scripts/samples/ (default: all of them)",
     )
     args = parser.parse_args()
 

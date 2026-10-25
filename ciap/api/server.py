@@ -9,7 +9,7 @@
 # All response shaping lives in views.py; all pipeline logic in state_store.py.
 # This module is only routing, validation, session bookkeeping and errors.
 #
-# Run:  uvicorn server:app
+# Run:  uvicorn ciap.api.server:app
 # Docs: http://127.0.0.1:8000/docs   (OpenAPI JSON: /openapi.json)
 #
 # Not production-ready as shipped -- no auth, in-memory sessions (idle calls
@@ -29,16 +29,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-import call_log
-import catalog
-import config
-import views
-from demo_web import router as demo_router
-from intents import INTENTS
-from mcp_tools import INTENT_TO_TOOL, TOOLS, executes_live
-from slots import SLOT_EXTRACTORS
-from state_store import ConversationStateStore
-from transcripts import parse_turns
+from ciap import call_log
+from ciap import catalog
+from ciap import config
+from ciap.integrations import mcp_client
+from ciap.api import views
+from ciap.api.demo_web import router as demo_router
+from ciap.pipeline.intents import INTENTS
+from ciap.integrations.mcp_tools import INTENT_TO_TOOL, TOOLS, executes_live
+from ciap.pipeline.slots import SLOT_EXTRACTORS
+from ciap.pipeline.state_store import ConversationStateStore
+from ciap.pipeline.transcripts import parse_turns
 
 logger = call_log.logger
 
@@ -49,26 +50,59 @@ MAX_TRANSCRIPT_TURNS = 200
 def warm_embeddings():
     """Load the sentence-embedding model and build the exemplar index, so the
     first real turn isn't a 2-5s cold start."""
-    from embeddings import retrieve
+    from ciap.pipeline.embeddings import retrieve
 
     start = time.perf_counter()
     retrieve("warm up")
     logger.info("embedding index warmed (%.1fs)", time.perf_counter() - start)
 
 
+def warm_responder():
+    """Load the responder model into Ollama, so the first live tool answer
+    isn't spent loading it (and falling back on the timeout). A failure is
+    logged, not fatal: answers then fall back until Ollama has the model."""
+    from ciap.pipeline import responder
+
+    start = time.perf_counter()
+    try:
+        responder.warm()
+    except Exception as exc:
+        logger.warning("responder model %s not warmed: %s: %s", responder.MODEL_NAME, type(exc).__name__, exc)
+        return
+    logger.info("responder model %s warmed (%.1fs)", responder.MODEL_NAME, time.perf_counter() - start)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Adds the model-load time to boot instead of the first turn. (The
     # escalation LLM is still lazy -- warm it with one escalating turn if the
-    # first live one needs to be fast.)
+    # first live one needs to be fast.) The responder model is warmed too:
+    # its answers have a timeout a cold load would always blow.
     if catalog.load():
         logger.info("catalog loaded from %s", config.CATALOG_PATH)
     warm_embeddings()
+    warm_responder()
+    _check_connections()
     sweeper = asyncio.create_task(_sweep_idle_calls_forever())
     yield
+    mcp_client.shutdown()
     sweeper.cancel()
     with suppress(asyncio.CancelledError):
         await sweeper
+
+
+def _check_connections():
+    # Report connection config problems at boot rather than on the first call.
+    try:
+        problems = mcp_client.check_connections()
+    except Exception as exc:
+        logger.warning("MCP connections file unreadable: %s", exc)
+        return
+    for name, problem in problems.items():
+        if problem:
+            logger.warning("MCP connection %s won't work: %s", name, problem)
+        else:
+            logger.info("MCP connection %s configured", name)
 
 
 # -- errors -------------------------------------------------------------------
@@ -235,8 +269,22 @@ class FrameView(BaseModel):
     tool_result: dict | None = Field(
         default=None,
         description=(
-            "Response from a tool that actually executed. Only `search_zoho_lead` "
-            "does today (a failure appears as `{\"error\": ...}`); null for every mock tool."
+            "Outcome of a tool that actually executed (one with a `remote` MCP binding; "
+            "the shipped Zoho CRM lookups and the product tools), always "
+            "`{\"status\": \"success\" | \"no_results\" | \"error\", \"data\": ..., \"message\": ...}`: "
+            "`data` is the server's response on success (null otherwise), `message` explains "
+            "`no_results` and `error` (null on success). Null for every mock tool."
+        ),
+    )
+    answer: dict | None = Field(
+        default=None,
+        description=(
+            "`tool_result` as a short plain-English briefing for the agent, answering what was "
+            "asked on the call: `{\"text\": ..., \"source\": \"llm\" | \"fallback\" | \"rule\", "
+            "\"model\": ..., \"note\": ...}`. `llm`: written by the responder model; `fallback`: "
+            "a plain listing of the result because the model failed, timed out or mentioned a value "
+            "not in the result (`note` says which); `rule`: a fixed sentence for `no_results` / "
+            "`error`. `model` is set for `llm` only. Null whenever `tool_result` is."
         ),
     )
 
@@ -292,7 +340,8 @@ class ToolInfo(BaseModel):
     description: str
     input_schema: dict
     intents: list[str] = Field(..., description="Intents that fire this tool.")
-    executes_live: bool = Field(..., description="True if the tool really runs against a backend; false if it's a mock.")
+    executes_live: bool = Field(..., description="True if the tool has a `remote` binding and really runs; false if it's a mock.")
+    remote: dict | None = Field(None, description="How the tool executes on a remote MCP server, or null for a mock (see `RemoteBinding`).")
 
 
 CatalogName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
@@ -323,6 +372,36 @@ class IntentCreate(IntentUpdate):
     name: CatalogName = Field(..., description="Lowercase snake_case. Change it later with `POST /v1/intents/{name}/rename`.")
 
 
+class RemoteBinding(BaseModel):
+    """Runs the tool as a call to a tool on a remote MCP server."""
+
+    connection: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$")] = Field(
+        ..., description="A connection configured in the MCP connections file (see `GET /v1/connections`)."
+    )
+    tool: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)] = Field(
+        ..., description="The tool's name on that server (see `GET /v1/connections/{name}/tools`)."
+    )
+    arguments: dict | None = Field(
+        None,
+        description=(
+            "What to send the remote tool. `{name}` inside a string is replaced by this tool's argument "
+            "of that name; a value that is exactly `\"{name}\"` passes it through as-is; anything else "
+            "is sent unchanged. Omit to send this tool's arguments as they are."
+        ),
+        examples=[{"module": "Leads", "criteria": "(Email:equals:{email})"}],
+    )
+    fallback: "RemoteBinding | None" = Field(
+        None,
+        description=(
+            "Another binding to try when this one finds nothing (e.g. search Leads, then Contacts). "
+            "It can have its own `fallback`. An error stops the chain: the call reports that error."
+        ),
+    )
+
+
+RemoteBinding.model_rebuild()
+
+
 class ToolUpdate(BaseModel):
     label: Label | None = Field(default=None, description=_LABEL_FIELD_DESCRIPTION)
     description: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
@@ -331,6 +410,13 @@ class ToolUpdate(BaseModel):
         description=(
             'JSON Schema: `{"type": "object", "properties": {...}, "required": [...]}`. '
             "Arguments are filled from the firing intent's slots by property name."
+        ),
+    )
+    remote: RemoteBinding | None = Field(
+        None,
+        description=(
+            "Run the tool on a remote MCP server. On create, omit it for a mock. On update, "
+            "omit it to keep the current binding, or send null to make the tool a mock."
         ),
     )
 
@@ -622,7 +708,7 @@ _CONFLICT = {409: {"model": ErrorResponse, "description": "Conflicts with the cu
 @app.get("/v1/tenants/{tenant_id}/calls/{call_id}", response_model=CallStateResponse, tags=["calls"], responses=_NOT_FOUND)
 def get_call(tenant_id: str, call_id: str):
     """Current state of every frame opened in this call, including each frame's
-    `tool_call` and (for `search_zoho_lead`) `tool_result`."""
+    `tool_call` and (for tools that really execute) `tool_result`."""
     key = (tenant_id, call_id)
     session = _get_session(key, touch=False)
     with session.lock:
@@ -687,8 +773,11 @@ def post_turn(
     | `slot_override` | override | Produced by the archived `PATCH .../slots/{slot}`, never by this endpoint. |
 
     `slots.frames[].tool_call` is set when a frame's required slots are all
-    filled. Every tool is a mock except `search_zoho_lead`, which really
-    executes; its response is `tool_result`.
+    filled. Tools with a `remote` binding really execute on their MCP server
+    (the shipped Zoho CRM lookups and the product tools); the response is `tool_result`,
+    and `answer` is that result as a briefing for the agent. The turn waits
+    for the call, up to `MCP_CALL_TIMEOUT_SECONDS`, then for the answer, up
+    to `RESPONDER_TIMEOUT_SECONDS`.
     """
     key = (tenant_id, call_id)
     session = _get_or_create_session(key, source="turn", user_id=turn.user_id)
@@ -774,6 +863,7 @@ def _tool_info(name: str) -> ToolInfo:
         input_schema=spec["inputSchema"],
         intents=[i for i, t in INTENT_TO_TOOL.items() if t == name],
         executes_live=executes_live(name),
+        remote=spec.get("remote"),
     )
 
 
@@ -852,7 +942,8 @@ def delete_intent(name: str):
 @app.get("/v1/tools", response_model=list[ToolInfo], tags=["catalog"])
 def list_tools():
     """The MCP-shaped tool catalog. `executes_live` marks the tools that really
-    run against a backend; all others are mocks that only build the call."""
+    run on a remote MCP server (`remote`); all others are mocks that only build
+    the call."""
     return [_tool_info(name) for name in list(TOOLS)]
 
 
@@ -866,9 +957,10 @@ def get_tool(name: str):
     responses={**_INVALID, 409: {"model": ErrorResponse, "description": "Tool already exists."}},
 )
 def create_tool(body: ToolCreate):
-    """Add a tool. New tools are mocks: they build a call but don't execute.
-    Map an intent to it with `PUT /v1/intents/{name}`."""
-    catalog.put_tool(body.name, body.label, body.description, body.input_schema, create=True)
+    """Add a tool. Without `remote` it's a mock: it builds a call but doesn't
+    execute. Map an intent to it with `PUT /v1/intents/{name}`."""
+    remote = body.remote.model_dump(exclude_none=True) if body.remote else None
+    catalog.put_tool(body.name, body.label, body.description, body.input_schema, create=True, remote=remote)
     call_log.log_event("tool_created", tool=body.name)
     return _tool_info(body.name)
 
@@ -876,9 +968,14 @@ def create_tool(body: ToolCreate):
 @app.put("/v1/tools/{name}", response_model=ToolInfo, tags=["catalog"], responses={**_CATALOG_NOT_FOUND, **_INVALID})
 def update_tool(name: str, body: ToolUpdate):
     """Replace a tool's label, description and input schema (an omitted label
-    falls back to the humanized name). Refused if an intent
-    mapped to it doesn't collect every argument the new schema requires."""
-    catalog.put_tool(name, body.label, body.description, body.input_schema, create=False)
+    falls back to the humanized name), and its `remote` binding if sent.
+    Refused if an intent mapped to it doesn't collect every argument the new
+    schema requires."""
+    if "remote" not in body.model_fields_set:
+        remote = catalog.KEEP
+    else:
+        remote = body.remote.model_dump(exclude_none=True) if body.remote else None
+    catalog.put_tool(name, body.label, body.description, body.input_schema, create=False, remote=remote)
     call_log.log_event("tool_updated", tool=name)
     return _tool_info(name)
 
@@ -918,6 +1015,44 @@ def list_slots():
     return sorted(SLOT_EXTRACTORS)
 
 
+# -- MCP connections -------------------------------------------------------------
+
+
+class RemoteToolInfo(BaseModel):
+    name: str = Field(..., description="Use as `remote.tool` on a catalog tool.")
+    description: str
+    input_schema: dict
+    annotations: dict = Field(..., description="The server's hints, e.g. `readOnlyHint`, `destructiveHint`.")
+    allowed: bool = Field(
+        ..., description="False if the connection's `allowed_tools` leaves this tool out: it can't be bound or called."
+    )
+
+
+@app.get("/v1/connections", response_model=list[str], tags=["connections"])
+def list_connections():
+    """Names of the configured MCP connections (`config.MCP_CONNECTIONS_PATH`).
+    URLs and credentials are never returned."""
+    return mcp_client.connection_names()
+
+
+@app.get(
+    "/v1/connections/{name}/tools", response_model=list[RemoteToolInfo], tags=["connections"],
+    responses={
+        404: {"model": ErrorResponse, "description": "No such connection (`connection_not_found`)."},
+        502: {"model": ErrorResponse, "description": "The MCP server couldn't be reached or refused (`connection_failed`)."},
+    },
+)
+def list_connection_tools(name: str):
+    """The tools the connection's MCP server offers. Use these to fill a
+    catalog tool's `remote` binding."""
+    try:
+        return mcp_client.list_tools(name)
+    except mcp_client.ConnectionNotConfigured as exc:
+        raise ApiError(404, "connection_not_found", str(exc))
+    except Exception as exc:
+        raise ApiError(502, "connection_failed", f"{type(exc).__name__}: {exc}")
+
+
 # -- ops ----------------------------------------------------------------------
 
 
@@ -939,7 +1074,7 @@ def get_log(
 def health():
     """`ok` when the escalation LLM server answers; `degraded` when it doesn't.
     Degraded still serves turns: LLM escalations fall back to a heuristic."""
-    import llm
+    from ciap.pipeline import llm
 
     try:
         llm._client.list()

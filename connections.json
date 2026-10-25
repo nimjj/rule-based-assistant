@@ -1,0 +1,85 @@
+{
+  "zoho": {
+    "url": "${ZOHO_MCP_URL}",
+    "timeout_seconds": 10,
+    "response": {
+      "status_field": "status",
+      "data_field": "data",
+      "message_field": "message",
+      "success_values": ["success"],
+      "error_values": ["failure", "error"],
+      "empty_message_pattern": "Empty response received from API.*Status - 204"
+    }
+  },
+
+  "hubspot": {
+    "url": "https://mcp.hubspot.com/",
+    "auth": {
+      "type": "mcp_oauth",
+      "client_id": "${HUBSPOT_CLIENT_ID}",
+      "client_secret": "${HUBSPOT_CLIENT_SECRET}"
+    },
+    "timeout_seconds": 8
+  },
+
+  "helpdesk": {
+    "url": "${HELPDESK_MCP_URL}",
+    "headers": { "X-API-Key": "${HELPDESK_API_KEY}" },
+    "allowed_tools": ["get_ticket", "search_tickets"]
+  },
+
+  "shop": {
+    "url": "${SHOP_MCP_URL}",
+    "auth": { "type": "bearer", "token": "${SHOP_ACCESS_TOKEN}" },
+    "timeout_seconds": 6,
+    "allowed_tools": ["get_order", "get_product"]
+  },
+
+  "erp": {
+    "url": "${ERP_MCP_URL}",
+    "auth": {
+      "type": "oauth2",
+      "token_url": "https://auth.erp-vendor.com/oauth/token",
+      "client_id": "${ERP_CLIENT_ID}",
+      "client_secret": "${ERP_CLIENT_SECRET}",
+      "scope": "orders.read inventory.read",
+      "extra_params": { "audience": "https://api.erp-vendor.com" }
+    },
+    "allowed_tools": ["get_sales_order", "get_stock_level"]
+  },
+
+  "salesforce": {
+    "url": "${SALESFORCE_MCP_URL}",
+    "auth": {
+      "type": "oauth2",
+      "token_url": "https://login.salesforce.com/services/oauth2/token",
+      "client_id": "${SF_CLIENT_ID}",
+      "client_secret": "${SF_CLIENT_SECRET}",
+      "refresh_token": "${SF_REFRESH_TOKEN}"
+    },
+    "timeout_seconds": 8,
+    "allowed_tools": ["query_records", "get_record"]
+  },
+
+  "legacy_crm": {
+    "transport": "sse",
+    "url": "${LEGACY_CRM_SSE_URL}",
+    "auth": { "type": "bearer", "token": "${LEGACY_CRM_TOKEN}" }
+  },
+
+  "billing": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@billing-vendor/mcp-server"],
+    "env": { "BILLING_API_KEY": "${BILLING_API_KEY}" },
+    "allowed_tools": ["get_invoice", "list_payments"]
+  },
+
+  "internal_orders": {
+    "transport": "stdio",
+    "command": "python",
+    "args": ["-m", "acme_mcp.orders_server"],
+    "env": { "ORDERS_DB_URL": "${ORDERS_DB_URL}" },
+    "timeout_seconds": 3
+  }
+}

@@ -1,0 +1,9 @@
+[project]
+name = "ciap-agent-assist"
+version = "0.1.0"
+description = "Intent detection, slot filling and tool calls for live customer calls."
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

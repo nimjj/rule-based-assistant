@@ -190,7 +190,7 @@ function onSlotsPanelKeydown(e) {
 // Same "Speaker: text" convention as transcripts.py's parse_turn / real transcripts.
 const TURN_RE = /^(Customer|Agent):\s*(.*)$/i;
 
-// tools/demo.py's "call" mode simulates speaking delay at CUSTOMER_SPEAK_SECONDS=2.0 /
+// scripts/demo.py's "call" mode simulates speaking delay at CUSTOMER_SPEAK_SECONDS=2.0 /
 // AGENT_SPEAK_SECONDS=1.0 before each turn appears. This is that same pacing
 // at 0.5x, for browser playback.
 const CUSTOMER_DELAY_MS = 1000;
@@ -305,6 +305,17 @@ function renderTranscript() {
     row.querySelector(".turn-text").textContent = t.utterance;
     row.onclick = () => { state.selected = i; render(); };
     box.appendChild(row);
+    for (const { call, answer } of answersForTurn(t)) {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "answer-card answer-" + answer.source + (i === state.selected ? " active" : "");
+      card.innerHTML =
+        `<span class="answer-card-head">For the agent &middot; ${esc(call.tool_label || call.tool)}</span>` +
+        `<span class="answer-card-text"></span>`;
+      card.querySelector(".answer-card-text").textContent = answer.text;
+      card.onclick = row.onclick;
+      box.appendChild(card);
+    }
   });
   box.scrollTop = grew ? box.scrollHeight : prevScroll;
 }
@@ -400,33 +411,60 @@ function renderSlots(view) {
   }).join("");
 }
 
-function mcpBlock(call, result) {
+// Where an answer came from, for its badge: the model that wrote it, or why
+// it's a plain listing / fixed sentence instead (see responder.py).
+const ANSWER_SOURCE_LABELS = { llm: "written by", fallback: "fallback listing", rule: "fixed message" };
+
+function answerBlock(answer) {
+  if (!answer) return "";
+  const source = ANSWER_SOURCE_LABELS[answer.source] || answer.source;
+  const badge = answer.source === "llm" ? `${source} ${answer.model}` : source;
+  const note = answer.note ? `<div class="mcp-answer-note">${esc(answer.note)}</div>` : "";
+  return `<div class="mcp-answer answer-${esc(answer.source)}">
+    <div class="mcp-answer-head">
+      ANSWER FOR THE AGENT
+      <span class="mcp-answer-source">${esc(badge)}</span>
+    </div>
+    <p>${esc(answer.text)}</p>
+    ${note}
+  </div>`;
+}
+
+function mcpBlock(call, result, answer) {
   const envelope = {
     method: "tools/call",
     params: { name: call.tool, arguments: call.arguments },
   };
+  // With an answer on top, the raw response is detail: folded, one click away.
   const resultBlock = result != null
-    ? `<div class="mcp-result">
-        <div class="mcp-result-head">&#9664; RESPONSE FROM MCP</div>
+    ? `<details class="mcp-result"${answer ? "" : " open"}>
+        <summary class="mcp-result-head">&#9664; RESPONSE FROM MCP <span class="mcp-result-status">${esc(result.status)}</span></summary>
         <pre>${esc(JSON.stringify(result, null, 2))}</pre>
-      </div>`
+      </details>`
     : "";
   return `<div class="mcp-call live">
+    ${answerBlock(answer)}
     <div class="mcp-call-head">&#9654; CALL SENT TO MCP</div>
     <pre>${esc(JSON.stringify(envelope, null, 2))}</pre>
     ${resultBlock}
   </div>`;
 }
 
-// A fired call's result lives on its frame (view.slots.frames[].tool_result),
-// not on the mcp.fired_this_turn entry itself -- match by tool_call content
-// to find it. Mocked tools have no zoho_client wired up, so tool_result is
-// just null for them and no RESPONSE block renders.
-function resultForCall(view, call) {
-  const frame = (view.slots.frames || []).find(
+// A fired call's result and answer live on its frame
+// (view.slots.frames[].tool_result / .answer), not on the mcp.fired_this_turn
+// entry itself -- match by tool_call content to find it. Mock tools have no
+// remote MCP binding, so both are just null for them and nothing renders.
+function frameForCall(view, call) {
+  return (view.slots.frames || []).find(
     (f) => f.tool_call && JSON.stringify(f.tool_call) === JSON.stringify(call)
-  );
-  return frame ? frame.tool_result : null;
+  ) || {};
+}
+
+// The answers a turn produced: one per live tool call it fired.
+function answersForTurn(view) {
+  return (view.mcp.fired_this_turn || [])
+    .map((call) => ({ call, answer: frameForCall(view, call).answer }))
+    .filter((a) => a.answer);
 }
 
 function renderMcp(view) {
@@ -435,7 +473,10 @@ function renderMcp(view) {
 
   const fired = view.mcp.fired_this_turn || [];
   const now = fired.length
-    ? fired.map((call) => mcpBlock(call, resultForCall(view, call))).join("")
+    ? fired.map((call) => {
+        const frame = frameForCall(view, call);
+        return mcpBlock(call, frame.tool_result, frame.answer);
+      }).join("")
     : `<div class="mcp-idle">No MCP call this turn &mdash; a frame fires only once every required slot is filled.</div>`;
 
   const all = view.mcp.all_calls || [];

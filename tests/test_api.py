@@ -1,20 +1,63 @@
 # API tests. The embedding model and the LLM are faked so these run offline
-# and deterministically; slot extraction, the state machine, views and the
-# HTTP layer are real.  Run: pytest tests
+# and deterministically, and the Zoho MCP server is an in-process fake; slot
+# extraction, the state machine, views, the MCP client and the HTTP layer are
+# real.  Run: pytest tests
 
 import itertools
 import json
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-import call_log
-import config
-import intents
-import mcp_tools
-import state_store
-import zoho_client
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
+from ciap import call_log
+from ciap import config
+from ciap.pipeline import intents
+from ciap.pipeline import responder
+from ciap.integrations import mcp_client
+from ciap.integrations import mcp_tools
+from ciap.pipeline import state_store
+
+# Stands in for Zoho's hosted MCP server behind the "zoho" connection,
+# including its {"status", "data"} result envelope.
+fake_zoho = MCPServer("fake-zoho")
+fake_zoho_state = {"down": False, "unauthorised": False, "searches": []}
+
+
+@fake_zoho.tool()
+def ZohoCRM_searchRecords(path_variables: dict, query_params: dict) -> dict:
+    """Search a CRM module."""
+    fake_zoho_state["searches"].append(path_variables["module"])
+    if fake_zoho_state["down"]:
+        raise ToolError("zoho down")
+    if fake_zoho_state["unauthorised"]:
+        return {"status": "failure", "data": {"message": "You cannot perform this operation. Connection not authorised"}}
+    assert path_variables["module"] in ("Leads", "Contacts")
+    email = query_params["email"]
+    # contact@...: no lead, but an existing customer in Contacts.
+    if email.startswith("contact") and path_variables["module"] == "Contacts":
+        return {"status": "success", "data": {"data": [{"Email": email, "Account_Name": {"name": "King"}}]}}
+    if email.startswith(("nobody", "contact")):
+        return {"status": "success", "data": {"message": "Empty response received from API. Service - CRM, "
+                                                         "Tool - ZohoCRM_searchRecords, With Status - 204."}}
+    return {"status": "success", "data": {"data": [{"Email": email}]}}
+
+
+@fake_zoho.tool()
+def empty_tool(email: str) -> None:
+    """Returns nothing."""
+    return None
+
+
+@fake_zoho.tool(annotations={"readOnlyHint": False})
+def slow_tool(email: str) -> dict:
+    """Takes too long."""
+    time.sleep(1)
+    return {"email": email}
 
 
 def fake_retrieve(text, top_k=3):
@@ -43,14 +86,27 @@ def fake_escalate(reason, utterance, context=None, fallback_intent=None):
     return {**base, "resolved_intent": fallback_intent, "is_correction_or_reference": True}
 
 
+fake_answer = {"text": None, "prompts": []}
+
+
 @pytest.fixture
 def client(monkeypatch, tmp_path, request):
-    import server
+    from ciap.api import server
 
     monkeypatch.setattr(state_store, "retrieve", fake_retrieve)
     monkeypatch.setattr(state_store.llm, "escalate", fake_escalate)
+    # The responder model replies with fake_answer["text"] (None: no answer).
+    fake_answer.update(text=None, prompts=[])
+    monkeypatch.setattr(responder, "_ask_model", lambda prompt: fake_answer["prompts"].append(prompt) or fake_answer["text"])
     monkeypatch.setattr(call_log, "TURN_LOG", tmp_path / "turns.jsonl")
-    monkeypatch.setattr(zoho_client, "search_lead", lambda email: {"data": [{"Email": email}]})
+    connections = tmp_path / "connections.json"
+    shipped_zoho = json.loads((ROOT / "connections.json").read_text())["zoho"]
+    connections.write_text(json.dumps({"zoho": {**shipped_zoho, "url": "http://zoho.invalid/mcp"}}), encoding="utf-8")
+    monkeypatch.setattr(config, "MCP_CONNECTIONS_PATH", str(connections))
+    # Only "zoho" is configured; it connects to the in-process fake.
+    monkeypatch.setattr(mcp_client, "_server_for", lambda name, spec: fake_zoho)
+    fake_zoho_state.update(down=False, unauthorised=False, searches=[])
+    request.addfinalizer(mcp_client.shutdown)
     # Catalog edits mutate these shared dicts in place: restore them after.
     for mod, attr in [(intents, "INTENTS"), (mcp_tools, "TOOLS"), (mcp_tools, "INTENT_TO_TOOL")]:
         original = getattr(mod, attr)
@@ -84,6 +140,7 @@ class clock:
     now = 1000.0
 
 
+ROOT = Path(__file__).resolve().parent.parent
 TENANT = "acme"
 _pbx_ids = itertools.count(1)
 
@@ -137,7 +194,7 @@ def test_lifecycle_get_reset_delete(client):
     ("get", ""), ("delete", ""), ("post", "/reset"),
 ])
 def test_idle_call_expires_on_access(client, method, path):
-    import server
+    from ciap.api import server
 
     cid = live_call(client)
     clock.now += 601
@@ -167,7 +224,7 @@ def test_get_does_not_keep_call_alive(client):
 
 
 def test_sweep_evicts_only_idle_calls(client):
-    import server
+    from ciap.api import server
 
     old, fresh = live_call(client), live_call(client)
     clock.now += 500
@@ -179,7 +236,7 @@ def test_sweep_evicts_only_idle_calls(client):
 
 
 def test_sweep_skips_call_with_turn_in_flight(client):
-    import server
+    from ciap.api import server
 
     cid = live_call(client)
     clock.now += 601
@@ -189,7 +246,7 @@ def test_sweep_skips_call_with_turn_in_flight(client):
 
 
 def test_zero_timeout_disables_expiry(client, monkeypatch):
-    import server
+    from ciap.api import server
 
     monkeypatch.setattr(config, "CALL_IDLE_TIMEOUT_SECONDS", 0)
     cid = live_call(client)
@@ -247,7 +304,7 @@ def test_same_call_id_under_two_tenants_is_two_calls(client):
 
 @pytest.mark.parametrize("tenant", ["x" * 129, "has space"])
 def test_invalid_tenant_id_creates_nothing(client, tenant):
-    import server
+    from ciap.api import server
 
     r = client.post(f"/v1/tenants/{tenant}/calls/{pbx_id()}/turns", json={"utterance": "hi"})
     assert_error(r, 422, "validation_error")
@@ -255,14 +312,14 @@ def test_invalid_tenant_id_creates_nothing(client, tenant):
 
 
 def test_invalid_call_id_on_turn_creates_nothing(client):
-    import server
+    from ciap.api import server
 
     assert_error(turn(client, "x" * 129, "hi"), 422, "validation_error")
     assert server._calls == {}
 
 
 def test_transcript_starts_the_call_only_if_valid(client):
-    import server
+    from ciap.api import server
 
     cid = pbx_id()
     bad = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/transcript", json={"transcript": "no tagged lines"})
@@ -344,18 +401,178 @@ def test_zoho_tool_result_exposed(client):
     v = turn(client, cid, "look me up at jane@example.com").json()
     frame = v["slots"]["frames"][0]
     assert frame["tool_call"]["tool"] == "search_zoho_lead"
-    assert frame["tool_result"] == {"data": [{"Email": "jane@example.com"}]}
+    assert frame["tool_result"] == {"status": "success", "data": {"data": [{"Email": "jane@example.com"}]}, "message": None}
     assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["tool_result"] == frame["tool_result"]
 
 
-def test_zoho_failure_is_a_tool_error_not_a_500(client, monkeypatch):
-    def boom(email):
-        raise RuntimeError("zoho down")
-    monkeypatch.setattr(zoho_client, "search_lead", boom)
+def test_zoho_answer_written_by_model(client):
+    fake_answer["text"] = "Jane (jane@example.com) is in Zoho as a lead."
+    cid = new_call(client)
+    frame = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]
+    assert frame["answer"] == {"text": fake_answer["text"], "source": "llm", "model": responder.MODEL_NAME, "note": None}
+    prompt = fake_answer["prompts"][0]
+    assert 'Customer: "look me up at jane@example.com"' in prompt and "Email: jane@example.com" in prompt
+    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["answer"] == frame["answer"]
+
+
+def test_zoho_answer_falls_back_on_invented_value(client):
+    fake_answer["text"] = "Lead 98765 belongs to jane@example.com."
+    cid = new_call(client)
+    answer = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]["answer"]
+    assert answer["source"] == "fallback" and "98765" in answer["note"]
+    assert answer["text"] == "Zoho CRM Customer Lookup found 1 result: email jane@example.com."
+
+
+def test_zoho_answer_falls_back_when_model_fails(client, monkeypatch):
+    def down(prompt):
+        raise ConnectionError("ollama down")
+    monkeypatch.setattr(responder, "_ask_model", down)
+    cid = new_call(client)
+    answer = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]["answer"]
+    assert answer["source"] == "fallback" and "ollama down" in answer["note"] and answer["model"] is None
+
+
+def test_answer_question_spans_slot_fill_turns(client):
+    fake_answer["text"] = "Found Jane."
+    cid = new_call(client)
+    turn(client, cid, "can you look me up")
+    turn(client, cid, "what's your email?", speaker="agent")
+    turn(client, cid, "it's jane@example.com")
+    prompt = fake_answer["prompts"][0]
+    assert 'Customer: "can you look me up"\nCustomer: "it\'s jane@example.com"' in prompt
+
+
+def test_answer_rules_for_no_results_and_error(client):
+    cid = new_call(client)
+    answer = turn(client, cid, "look me up at nobody@example.com").json()["slots"]["frames"][0]["answer"]
+    assert answer == {"text": "Zoho CRM Customer Lookup: nothing found for email nobody@example.com.",
+                      "source": "rule", "model": None, "note": None}
+    fake_zoho_state["down"] = True
+    cid = new_call(client)
+    answer = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]["answer"]
+    assert answer["source"] == "rule" and "zoho down" in answer["text"]
+    assert fake_answer["prompts"] == []
+
+
+def test_mock_tool_has_no_answer(client):
+    cid = new_call(client)
+    frame = turn(client, cid, "track ORD-12345").json()["slots"]["frames"][0]
+    assert frame["tool_result"] is None and frame["answer"] is None
+
+
+def test_lookup_falls_back_to_contacts(client):
+    cid = new_call(client)
+    frame = turn(client, cid, "look me up at contact@example.com").json()["slots"]["frames"][0]
+    assert fake_zoho_state["searches"] == ["Leads", "Contacts"]
+    assert frame["tool_result"]["status"] == "success"
+    assert frame["tool_result"]["data"] == {"data": [{"Email": "contact@example.com", "Account_Name": {"name": "King"}}]}
+
+
+def test_lookup_stops_at_first_match_or_error(client):
+    cid = new_call(client)
+    turn(client, cid, "look me up at jane@example.com")
+    assert fake_zoho_state["searches"] == ["Leads"]  # found a lead: Contacts never searched
+    fake_zoho_state.update(unauthorised=True, searches=[])
+    frame = turn(client, new_call(client), "look me up at jane@example.com").json()["slots"]["frames"][0]
+    assert frame["tool_result"]["status"] == "error" and fake_zoho_state["searches"] == ["Leads"]
+
+
+def test_lookup_with_no_match_anywhere_is_no_results(client):
+    frame = turn(client, new_call(client), "look me up at nobody@example.com").json()["slots"]["frames"][0]
+    assert frame["tool_result"]["status"] == "no_results" and fake_zoho_state["searches"] == ["Leads", "Contacts"]
+
+
+def test_tool_fallback_binding_validated(client):
+    spec = client.get("/v1/tools/search_zoho_lead").json()
+    body = {"description": spec["description"], "input_schema": spec["input_schema"]}
+    bad = {"connection": "zoho", "tool": "ZohoCRM_searchRecords",
+           "fallback": {"connection": "zoho", "tool": "ZohoCRM_searchRecords", "arguments": {"q": "{phone}"}}}
+    assert_error(client.put("/v1/tools/search_zoho_lead", json={**body, "remote": bad}), 422, "invalid_remote")
+    good = {**bad, "fallback": {"connection": "zoho", "tool": "ZohoCRM_searchRecords", "arguments": {"q": "{email}"}}}
+    r = client.put("/v1/tools/search_zoho_lead", json={**body, "remote": good})
+    assert r.status_code == 200 and r.json()["remote"]["fallback"]["arguments"] == {"q": "{email}"}
+
+
+@pytest.mark.parametrize("slot, text, value", [
+    ("phone", "my number is 555-555-5555", "555-555-5555"),
+    ("phone", "call me on +1 (415) 555 0134 please", "+1 (415) 555 0134"),
+    ("phone", "order ORD-48213 from 2026", None),
+    ("company_name", "Hi, I'm calling from Truhlar And Truhlar about our account", "Truhlar And Truhlar"),
+    ("company_name", "I'm with the Rangoni Of Florence team", "Rangoni Of Florence"),
+    ("company_name", "can you look up our company account", None),
+    ("deal_name", "where are we on the Commercial Press deal?", "Commercial Press"),
+    ("deal_name", "The King deal, has it closed?", "King"),
+    ("deal_name", "what stage is the deal with Truhlar And Truhlar Attys in", "Truhlar And Truhlar Attys"),
+    ("deal_name", "how is our deal going", None),
+])
+def test_crm_slot_extractors(slot, text, value):
+    from ciap.pipeline.slots import SLOT_EXTRACTORS
+    assert SLOT_EXTRACTORS[slot](text) == value
+
+
+def test_responder_prune_and_fallback_render():
+    data = {"data": [
+        {"id": "1", "$approval": {"x": 1}, "First_Name": "Jane", "Company": "", "Owner": {"name": "Priya"},
+         "Tags": [], "leadStatus": "Contacted"},
+        {"id": "2", "First_Name": "John"},
+    ], "info": {"count": 2}}
+    pruned = responder.prune(data)
+    assert pruned["data"][0] == {"id": "1", "First_Name": "Jane", "Owner": {"name": "Priya"}, "leadStatus": "Contacted"}
+    assert responder.render_fallback("search_zoho_lead", pruned) == (
+        "Zoho CRM Customer Lookup found 2 results: (1) first name Jane, owner name Priya, lead status Contacted. "
+        "(2) first name John."
+    )
+    assert responder.render_fallback("search_zoho_lead", {"text": "No such lead."}) == "Zoho CRM Customer Lookup: No such lead."
+
+
+def test_responder_grounding_check():
+    data = {"amount": 1499.0, "email": "Jane@Example.com"}
+    assert responder.ungrounded_values("Paid 1,499 by jane@example.com.", data) == []
+    assert responder.ungrounded_values("Paid 2,000 by bob@example.com.", data) == ["bob@example.com", "2000"]
+
+
+def test_zoho_failure_is_a_tool_error_not_a_500(client):
+    fake_zoho_state["down"] = True
     cid = new_call(client)
     r = turn(client, cid, "look me up at jane@example.com")
     assert r.status_code == 200
-    assert "zoho down" in r.json()["slots"]["frames"][0]["tool_result"]["error"]
+    result = r.json()["slots"]["frames"][0]["tool_result"]
+    assert result["status"] == "error" and result["data"] is None and "zoho down" in result["message"]
+
+
+def test_zoho_no_match_is_no_results(client):
+    cid = new_call(client)
+    frame = turn(client, cid, "look me up at nobody@example.com").json()["slots"]["frames"][0]
+    assert frame["tool_result"] == {"status": "no_results", "data": None, "message": mcp_tools.NO_RESULTS_MESSAGE}
+
+
+def test_tool_returning_nothing_is_no_results(client):
+    spec = client.get("/v1/tools/search_zoho_lead").json()
+    client.put("/v1/tools/search_zoho_lead", json={
+        "description": spec["description"], "input_schema": spec["input_schema"],
+        "remote": {"connection": "zoho", "tool": "empty_tool"},
+    })
+    cid = new_call(client)
+    frame = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]
+    assert frame["tool_result"]["status"] == "no_results"
+    assert frame["tool_result"]["message"] == mcp_tools.NO_RESULTS_MESSAGE
+
+
+@pytest.mark.parametrize("value, empty", [
+    (None, True), ({}, True), ("", True), ({"data": []}, True), ({"text": ""}, True),
+    ({"data": [], "info": {}}, True), ({"result": []}, True),
+    ({"data": [{"id": "1"}]}, False), ({"count": 0}, False), ({"ok": False}, False), ({"text": "hi"}, False),
+])
+def test_empty_results_detected(value, empty):
+    assert mcp_tools._is_empty(value) is empty
+
+
+def test_zoho_failure_status_is_a_tool_error(client):
+    fake_zoho_state["unauthorised"] = True
+    cid = new_call(client)
+    frame = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]
+    result = frame["tool_result"]
+    assert result["status"] == "error" and result["data"] is None and "Connection not authorised" in result["message"]
 
 
 # -- validation & errors -------------------------------------------------------
@@ -495,7 +712,7 @@ NEW_TOOL = {"name": "add_gift_wrap", "description": "Add gift wrap to an order."
 
 
 def test_intent_crud_persists_and_reloads(client):
-    import catalog
+    from ciap import catalog
 
     r = client.post("/v1/intents", json=NEW_INTENT)
     assert r.status_code == 201, r.text
@@ -527,7 +744,7 @@ def test_every_catalog_entry_ships_with_a_label(client):
         for item in client.get(path).json():
             assert item["label"] and item["label"] != item["name"], item["name"]
     assert client.get("/v1/intents/track_order").json()["label"] == "Track Order"
-    assert client.get("/v1/tools/search_zoho_lead").json()["label"] == "Search Zoho CRM Lead"
+    assert client.get("/v1/tools/search_zoho_lead").json()["label"] == "Zoho CRM Customer Lookup"
 
 
 def test_labels_on_turn_frame_and_call_views(client):
@@ -552,7 +769,7 @@ def test_labels_on_turn_frame_and_call_views(client):
 
 
 def test_label_create_update_persist_and_fallback(client):
-    import catalog
+    from ciap import catalog
 
     r = client.post("/v1/intents", json={**NEW_INTENT, "label": "  Gift Wrapping  "})
     assert r.status_code == 201 and r.json()["label"] == "Gift Wrapping"
@@ -590,8 +807,8 @@ def test_label_edit_shows_on_live_call(client):
 # -- renames ------------------------------------------------------------------
 
 def test_intent_rename_moves_spec_mapping_and_live_frames(client, monkeypatch):
-    import catalog
-    import embeddings
+    from ciap import catalog
+    from ciap.pipeline import embeddings
 
     original = client.get("/v1/intents/track_order").json()
     cid = new_call(client)
@@ -640,7 +857,7 @@ def test_tool_rename_repoints_intents_and_live_calls(client):
 def test_renamed_live_tool_still_executes(client):
     r = client.post("/v1/tools/search_zoho_lead/rename", json={"new_name": "crm_lead_search"})
     assert r.json()["executes_live"] is True
-    # A PUT (which can't set the backend) keeps it live too.
+    # A PUT that leaves out `remote` keeps it live too.
     spec = r.json()
     r = client.put("/v1/tools/crm_lead_search", json={"description": "Find a CRM lead.", "input_schema": spec["input_schema"]})
     assert r.json()["executes_live"] is True
@@ -649,16 +866,27 @@ def test_renamed_live_tool_still_executes(client):
     v = turn(client, cid, "look me up, jane@example.com").json()
     frame = v["slots"]["frames"][0]
     assert frame["tool_call"]["tool"] == "crm_lead_search"
-    assert frame["tool_result"] == {"data": [{"Email": "jane@example.com"}]}
+    assert frame["tool_result"] == {"status": "success", "data": {"data": [{"Email": "jane@example.com"}]}, "message": None}
 
 
 def test_old_saved_catalog_keeps_zoho_live(client):
-    import catalog
+    from ciap import catalog
 
-    tools = {n: {k: v for k, v in spec.items() if k != "backend"} for n, spec in mcp_tools.TOOLS.items()}
+    # Saved before tools had a "backend" (live by name) ...
+    tools = {n: {k: v for k, v in spec.items() if k != "remote"} for n, spec in mcp_tools.TOOLS.items()}
     Path(config.CATALOG_PATH).write_text(json.dumps({"intents": {}, "tools": tools}), encoding="utf-8")
     assert catalog.load()
-    assert client.get("/v1/tools/search_zoho_lead").json()["executes_live"] is True
+    assert client.get("/v1/tools/search_zoho_lead").json()["remote"] == mcp_tools.ZOHO_LEAD_SEARCH_REMOTE
+
+    # ... and with one, under a renamed tool.
+    tools = {("crm_lookup" if n == "search_zoho_lead" else n): {k: v for k, v in spec.items() if k != "remote"}
+             for n, spec in mcp_tools.TOOLS.items()}
+    tools["crm_lookup"]["backend"] = "zoho_lead_search"
+    Path(config.CATALOG_PATH).write_text(json.dumps({"intents": {}, "tools": tools}), encoding="utf-8")
+    assert catalog.load()
+    info = client.get("/v1/tools/crm_lookup").json()
+    assert info["executes_live"] is True and info["remote"]["connection"] == "zoho"
+    assert "backend" not in mcp_tools.TOOLS["crm_lookup"]
 
 
 @pytest.mark.parametrize("path,body,status,code", [
@@ -675,7 +903,7 @@ def test_rename_errors(client, path, body, status, code):
 
 
 def test_intent_edit_rebuilds_embedding_index(client, monkeypatch):
-    import embeddings
+    from ciap.pipeline import embeddings
 
     monkeypatch.setattr(embeddings, "_index", (["track_order"], None))
     client.post("/v1/intents", json=NEW_INTENT)
@@ -747,7 +975,7 @@ def test_tool_validation(client):
 
 
 def test_slots_catalog(client):
-    assert client.get("/v1/slots").json() == ["discount_code", "email", "new_date", "order_id", "product_name"]
+    assert client.get("/v1/slots").json() == ["company_name", "deal_name", "discount_code", "email", "new_date", "order_id", "phone", "product_name"]
 
 def test_log_records_and_filters(client):
     a, b = new_call(client), new_call(client)
@@ -791,7 +1019,7 @@ def test_invalid_user_id_is_rejected(client, user_id):
 
 
 def test_health_ok_and_degraded(client, monkeypatch):
-    import llm
+    from ciap.pipeline import llm
 
     monkeypatch.setattr(llm._client, "list", lambda: [])
     assert client.get("/health").json() == {"status": "ok", "ollama": True, "model": llm.MODEL_NAME}
@@ -823,3 +1051,227 @@ def test_openapi_documents_all_v1_routes(client):
               "/v1/intents", "/v1/intents/{name}", "/v1/tools", "/v1/tools/{name}", "/v1/slots",
               "/v1/log", "/health"]:
         assert p in paths, p
+
+
+# -- MCP connections and remote bindings ------------------------------------------
+
+def test_unconfigured_connection_is_a_tool_error(client):
+    spec = client.get("/v1/tools/search_zoho_lead").json()
+    r = client.put("/v1/tools/search_zoho_lead", json={
+        "description": spec["description"], "input_schema": spec["input_schema"],
+        "remote": {"connection": "salesforce", "tool": "ZohoCRM_searchRecords"},
+    })
+    assert r.status_code == 200, r.text
+    cid = new_call(client)
+    frame = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]
+    result = frame["tool_result"]
+    assert result["status"] == "error" and result["data"] is None and "not configured" in result["message"]
+
+
+def test_remote_binding_can_be_set_and_removed(client):
+    body = {**NEW_TOOL, "remote": {"connection": "zoho", "tool": "ZohoCRM_searchRecords",
+                                   "arguments": {"path_variables": {"module": "Orders"},
+                                                 "query_params": {"criteria": "(Order_ID:equals:{order_id})"}}}}
+    r = client.post("/v1/tools", json=body)
+    assert r.status_code == 201, r.text
+    assert r.json()["executes_live"] is True and r.json()["remote"]["tool"] == "ZohoCRM_searchRecords"
+
+    r = client.put("/v1/tools/add_gift_wrap", json={**{k: NEW_TOOL[k] for k in ("description", "input_schema")},
+                                                    "remote": None})
+    assert r.json()["executes_live"] is False and r.json()["remote"] is None
+
+
+@pytest.mark.parametrize("remote", [
+    {"connection": "zoho", "tool": "ZohoCRM_searchRecords",
+     "arguments": {"query_params": {"email": "{email}"}}},  # not an argument of this tool
+    {"connection": "Bad Name", "tool": "ZohoCRM_searchRecords"},
+    {"connection": "zoho", "tool": " "},
+])
+def test_invalid_remote_binding_rejected(client, remote):
+    r = client.post("/v1/tools", json={**NEW_TOOL, "remote": remote})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] in ("invalid_remote", "validation_error")
+    assert_error(client.get("/v1/tools/add_gift_wrap"), 404, "tool_not_found")
+
+
+def test_remote_arguments_rendered_from_tool_arguments():
+    template = {"module": "Leads", "criteria": "(Email:equals:{email})", "raw": "{email}", "limit": 1}
+    assert mcp_tools.render_arguments(template, {"email": "a@b.co"}) == {
+        "module": "Leads", "criteria": "(Email:equals:a@b.co)", "raw": "a@b.co", "limit": 1}
+
+
+def test_connections_and_their_tools_listed(client):
+    assert client.get("/v1/connections").json() == ["zoho"]
+    tools = {t["name"]: t for t in client.get("/v1/connections/zoho/tools").json()}
+    assert set(tools["ZohoCRM_searchRecords"]["input_schema"]["properties"]) == {"path_variables", "query_params"}
+    assert tools["slow_tool"]["annotations"] == {"readOnlyHint": False}
+    assert_error(client.get("/v1/connections/nope/tools"), 404, "connection_not_found")
+
+
+def test_slow_remote_tool_times_out_as_a_tool_error(client):
+    shipped = json.loads(Path(config.MCP_CONNECTIONS_PATH).read_text())["zoho"]
+    write_connections({"zoho": {**shipped, "timeout_seconds": 0.2}})
+    spec = client.get("/v1/tools/search_zoho_lead").json()
+    client.put("/v1/tools/search_zoho_lead", json={
+        "description": spec["description"], "input_schema": spec["input_schema"],
+        "remote": {"connection": "zoho", "tool": "slow_tool"},
+    })
+    cid = new_call(client)
+    start = time.perf_counter()
+    r = turn(client, cid, "look me up at jane@example.com")
+    assert r.status_code == 200 and time.perf_counter() - start < 1
+    result = r.json()["slots"]["frames"][0]["tool_result"]
+    assert result["status"] == "error" and result["data"] is None and "didn't answer" in result["message"]
+
+
+def test_shipped_connections_are_valid_and_keep_secrets_in_env_vars(monkeypatch):
+    # connections.json is committed: every URL, header and credential must be a
+    # ${NAME} reference, and each entry must pass validation. (An mcp_oauth URL
+    # can be literal: it carries no key, the saved sign-in is the secret.)
+    monkeypatch.setattr(config, "MCP_CONNECTIONS_PATH", str(ROOT / "connections.json"))
+    shipped = json.loads((ROOT / "connections.json").read_text())
+    for name, spec in shipped.items():
+        auth = spec.get("auth") or {}
+        url = None if auth.get("type") == "mcp_oauth" else spec.get("url")
+        secrets = [url, *spec.get("headers", {}).values(),
+                   *(auth.get(k) for k in ("token", "client_secret", "refresh_token"))]
+        for value in filter(None, secrets):
+            assert "${" in value, (name, value)
+        for ref in mcp_client._ENV_REF.findall(json.dumps(spec)):
+            monkeypatch.setenv(ref, "x" * 8)
+        mcp_client._connection_spec(name)
+
+
+# -- connection config -----------------------------------------------------------
+
+def write_connections(connections):
+    Path(config.MCP_CONNECTIONS_PATH).write_text(json.dumps(connections), encoding="utf-8")
+
+
+@pytest.mark.parametrize("spec, problem", [
+    ({"url": "https://x/mcp", "timeout": 5}, "timeout: Extra inputs are not permitted"),
+    ({}, 'needs "url"'),
+    ({"transport": "stdio"}, 'needs "command"'),
+    ({"transport": "stdio", "command": "srv", "url": "https://x"}, "not url/headers/auth"),
+    ({"url": "https://x", "auth": {"type": "basic"}}, "auth"),
+    ({"url": "https://x", "auth": {"type": "oauth2", "client_id": "c"}}, "auth.oauth2.token_url"),
+    ({"url": "https://x", "timeout_seconds": 0}, "timeout_seconds"),
+    ({"url": "${NOT_SET_ANYWHERE}"}, "NOT_SET_ANYWHERE is not set"),
+])
+def test_invalid_connection_config_is_reported(client, spec, problem):
+    write_connections({"zoho": spec})
+    assert problem in mcp_client.check_connections()["zoho"]
+    cid = new_call(client)
+    result = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]["tool_result"]
+    assert result["status"] == "error" and problem in result["message"]
+
+
+def test_valid_connection_configs_accepted(client, monkeypatch):
+    monkeypatch.setenv("CRM_TOKEN", "secret-token")
+    write_connections({
+        "a": {"url": "https://a/mcp", "auth": {"type": "bearer", "token": "${CRM_TOKEN}"}},
+        "b": {"url": "https://b/sse", "transport": "sse", "headers": {"X-Api-Key": "${CRM_TOKEN}"}},
+        "c": {"transport": "stdio", "command": "npx", "args": ["-y", "some-crm-mcp"], "env": {"KEY": "${CRM_TOKEN}"}},
+        "d": {"url": "https://d/mcp", "auth": {"type": "oauth2", "token_url": "https://d/token",
+                                                "client_id": "id", "client_secret": "${CRM_TOKEN}"}},
+    })
+    assert mcp_client.check_connections() == {"a": None, "b": None, "c": None, "d": None}
+    spec = mcp_client._connection_spec("a")
+    assert spec.redact("failed for https://a/mcp?k=secret-token") == "failed for https://a/mcp?k=***"
+
+
+def test_allowed_tools_limit_bindings_and_calls(client):
+    shipped = json.loads(Path(config.MCP_CONNECTIONS_PATH).read_text())["zoho"]
+    write_connections({"zoho": {**shipped, "allowed_tools": ["ZohoCRM_searchRecords"]}})
+    tools = {t["name"]: t["allowed"] for t in client.get("/v1/connections/zoho/tools").json()}
+    assert tools["ZohoCRM_searchRecords"] is True and tools["slow_tool"] is False
+
+    spec = client.get("/v1/tools/search_zoho_lead").json()
+    r = client.put("/v1/tools/search_zoho_lead", json={
+        "description": spec["description"], "input_schema": spec["input_schema"],
+        "remote": {"connection": "zoho", "tool": "slow_tool"},
+    })
+    assert_error(r, 422, "invalid_remote")
+    with pytest.raises(mcp_client.ToolCallFailed, match="allowed_tools"):
+        mcp_client.call_tool("zoho", "slow_tool", {"email": "a@b.co"})
+
+    cid = new_call(client)
+    frame = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]
+    assert frame["tool_result"]["status"] == "success"
+
+
+def test_without_response_config_the_envelope_passes_through(client):
+    write_connections({"zoho": {"url": "http://zoho.invalid/mcp"}})
+    cid = new_call(client)
+    result = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]["tool_result"]
+    assert result["status"] == "success"
+    assert result["data"] == {"status": "success", "data": {"data": [{"Email": "jane@example.com"}]}}
+
+
+def test_changed_connection_config_reconnects(client):
+    args = {"path_variables": {"module": "Leads"}, "query_params": {"email": "a@b.co"}}
+    mcp_client.call_tool("zoho", "ZohoCRM_searchRecords", args)
+    first = mcp_client._sessions["zoho"]
+    mcp_client.call_tool("zoho", "ZohoCRM_searchRecords", args)
+    assert mcp_client._sessions["zoho"] is first  # unchanged config: session reused
+
+    shipped = json.loads(Path(config.MCP_CONNECTIONS_PATH).read_text())["zoho"]
+    write_connections({"zoho": {**shipped, "timeout_seconds": 7}})
+    mcp_client.call_tool("zoho", "ZohoCRM_searchRecords", args)
+    assert mcp_client._sessions["zoho"] is not first
+
+
+def _mock_token_endpoint(monkeypatch, handler):
+    import httpx2
+
+    real_client = httpx2.AsyncClient
+    monkeypatch.setattr(httpx2, "AsyncClient", lambda **kw: real_client(transport=httpx2.MockTransport(handler), **kw))
+
+
+def test_oauth2_token_fetched_cached_and_refreshed(monkeypatch):
+    import asyncio
+    import httpx2
+
+    token_requests = []
+
+    def token_endpoint(request):
+        token_requests.append(dict(httpx2.QueryParams(request.content.decode())))
+        n = len(token_requests)
+        return httpx2.Response(200, json={"access_token": f"t{n}", "expires_in": 3600, "refresh_token": f"r{n}"})
+
+    _mock_token_endpoint(monkeypatch, token_endpoint)
+    flow = mcp_client._oauth2(mcp_client.OAuth2Auth(
+        type="oauth2", token_url="https://crm/token", client_id="id", client_secret="sec",
+        refresh_token="r0", scope="crm.read"))
+
+    async def send(status):
+        gen = flow.async_auth_flow(httpx2.Request("POST", "https://crm/mcp"))
+        request = await gen.__anext__()
+        sent = [request.headers["Authorization"]]
+        try:
+            request = await gen.asend(httpx2.Response(status))
+            sent.append(request.headers["Authorization"])
+        except StopAsyncIteration:
+            pass
+        return sent
+
+    assert asyncio.run(send(200)) == ["Bearer t1"]
+    assert asyncio.run(send(200)) == ["Bearer t1"]  # cached
+    assert asyncio.run(send(401)) == ["Bearer t1", "Bearer t2"]  # refreshed on a 401
+    assert token_requests[0] == {"client_id": "id", "client_secret": "sec", "scope": "crm.read",
+                                 "grant_type": "refresh_token", "refresh_token": "r0"}
+    assert token_requests[1]["refresh_token"] == "r1"  # the rotated refresh token is used
+
+
+def test_oauth2_token_error_reported(monkeypatch):
+    import asyncio
+    import httpx2
+
+    _mock_token_endpoint(monkeypatch, lambda request: httpx2.Response(200, json={"error": "invalid_client"}))
+    flow = mcp_client._oauth2(mcp_client.OAuth2Auth(type="oauth2", token_url="https://crm/token", client_id="id"))
+
+    async def send():
+        await flow.async_auth_flow(httpx2.Request("POST", "https://crm/mcp")).__anext__()
+
+    with pytest.raises(mcp_client.ToolCallFailed, match="invalid_client"):
+        asyncio.run(send())
