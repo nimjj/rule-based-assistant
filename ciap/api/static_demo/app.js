@@ -5,7 +5,7 @@
 // is a dumb renderer for that shape, so no pipeline branching logic lives
 // here.
 
-const state = { callId: null, turns: [], selected: -1, playing: false, speaker: "Customer" };
+const state = { callId: null, turns: [], selected: -1, playing: false, speaker: "Customer", answerMode: "focused" };
 
 // Optional server features, from /demo/config. Slot override is archived
 // server-side (config.SLOT_OVERRIDE_ENABLED); its edit button only shows when on.
@@ -86,6 +86,20 @@ function setSpeaker(speaker) {
   $("#speaker-agent").classList.toggle("active", speaker === "Agent");
 }
 
+// How tool results get explained: "focused" or "full" (see responder.py).
+// Sent with every turn, typed or played back.
+function setAnswerMode(mode) {
+  state.answerMode = mode;
+  $("#mode-focused").classList.toggle("active", mode === "focused");
+  $("#mode-full").classList.toggle("active", mode === "full");
+}
+
+function turnBody(utterance, speaker) {
+  return JSON.stringify({
+    utterance, speaker: speaker.toLowerCase(), user_id: DEMO_USER_ID, answer_mode: state.answerMode,
+  });
+}
+
 async function sendTurn() {
   const input = $("#utterance");
   const raw = input.value.trim();
@@ -98,7 +112,7 @@ async function sendTurn() {
   try {
     const view = await api(callPath("/turns"), {
       method: "POST",
-      body: JSON.stringify({ utterance: text, speaker: state.speaker.toLowerCase(), user_id: DEMO_USER_ID }),
+      body: turnBody(text, state.speaker),
     });
     state.turns.push(view);
     state.selected = state.turns.length - 1;
@@ -235,7 +249,7 @@ async function playTranscript(turns) {
       try {
         view = await api(callPath("/turns"), {
           method: "POST",
-          body: JSON.stringify({ utterance, speaker: speaker.toLowerCase(), user_id: DEMO_USER_ID }),
+          body: turnBody(utterance, speaker),
         });
       } catch (err) {
         flash("Playback stopped: " + err.message);
@@ -418,7 +432,7 @@ const ANSWER_SOURCE_LABELS = { llm: "written by", fallback: "fallback listing", 
 function answerBlock(answer) {
   if (!answer) return "";
   const source = ANSWER_SOURCE_LABELS[answer.source] || answer.source;
-  const badge = answer.source === "llm" ? `${source} ${answer.model}` : source;
+  const badge = (answer.source === "llm" ? `${source} ${answer.model}` : source) + ` · ${answer.mode}`;
   const note = answer.note ? `<div class="mcp-answer-note">${esc(answer.note)}</div>` : "";
   return `<div class="mcp-answer answer-${esc(answer.source)}">
     <div class="mcp-answer-head">
@@ -496,6 +510,8 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#send").onclick = sendTurn;
   $("#speaker-customer").onclick = () => setSpeaker("Customer");
   $("#speaker-agent").onclick = () => setSpeaker("Agent");
+  $("#mode-focused").onclick = () => setAnswerMode("focused");
+  $("#mode-full").onclick = () => setAnswerMode("full");
   $("#new-call").onclick = newCall;
   $("#stop-playback").onclick = stopPlayback;
   $("#upload-transcript").onclick = () => $("#transcript-file").click();

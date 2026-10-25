@@ -97,7 +97,10 @@ def client(monkeypatch, tmp_path, request):
     monkeypatch.setattr(state_store.llm, "escalate", fake_escalate)
     # The responder model replies with fake_answer["text"] (None: no answer).
     fake_answer.update(text=None, prompts=[])
-    monkeypatch.setattr(responder, "_ask_model", lambda prompt: fake_answer["prompts"].append(prompt) or fake_answer["text"])
+    monkeypatch.setattr(
+        responder, "_ask_model",
+        lambda prompt, mode="focused": fake_answer["prompts"].append(prompt) or fake_answer["text"],
+    )
     monkeypatch.setattr(call_log, "TURN_LOG", tmp_path / "turns.jsonl")
     connections = tmp_path / "connections.json"
     shipped_zoho = json.loads((ROOT / "connections.json").read_text())["zoho"]
@@ -409,7 +412,9 @@ def test_zoho_answer_written_by_model(client):
     fake_answer["text"] = "Jane (jane@example.com) is in Zoho as a lead."
     cid = new_call(client)
     frame = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]
-    assert frame["answer"] == {"text": fake_answer["text"], "source": "llm", "model": responder.MODEL_NAME, "note": None}
+    assert frame["answer"] == {
+        "text": fake_answer["text"], "source": "llm", "model": responder.MODEL_NAME, "note": None, "mode": "focused",
+    }
     prompt = fake_answer["prompts"][0]
     assert 'Customer: "look me up at jane@example.com"' in prompt and "Email: jane@example.com" in prompt
     assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["answer"] == frame["answer"]
@@ -424,7 +429,7 @@ def test_zoho_answer_falls_back_on_invented_value(client):
 
 
 def test_zoho_answer_falls_back_when_model_fails(client, monkeypatch):
-    def down(prompt):
+    def down(prompt, mode="focused"):
         raise ConnectionError("ollama down")
     monkeypatch.setattr(responder, "_ask_model", down)
     cid = new_call(client)
@@ -446,12 +451,50 @@ def test_answer_rules_for_no_results_and_error(client):
     cid = new_call(client)
     answer = turn(client, cid, "look me up at nobody@example.com").json()["slots"]["frames"][0]["answer"]
     assert answer == {"text": "Zoho CRM Customer Lookup: nothing found for email nobody@example.com.",
-                      "source": "rule", "model": None, "note": None}
+                      "source": "rule", "model": None, "note": None, "mode": "focused"}
     fake_zoho_state["down"] = True
     cid = new_call(client)
     answer = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]["answer"]
     assert answer["source"] == "rule" and "zoho down" in answer["text"]
     assert fake_answer["prompts"] == []
+
+
+def test_full_answer_mode(client, monkeypatch):
+    modes = []
+    monkeypatch.setattr(
+        responder, "_ask_model",
+        lambda prompt, mode="focused": modes.append(mode) or fake_answer["prompts"].append(prompt) or "Found Jane.",
+    )
+    cid = new_call(client)
+    body = {"utterance": "look me up at jane@example.com", "answer_mode": "full"}
+    answer = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/turns", json=body).json()["slots"]["frames"][0]["answer"]
+    assert answer["source"] == "llm" and answer["mode"] == "full" and modes == ["full"]
+    assert responder.INSTRUCTIONS["full"] in fake_answer["prompts"][0]
+    assert responder.INSTRUCTIONS["focused"] not in fake_answer["prompts"][0]
+
+
+def test_full_answer_mode_on_transcript(client):
+    fake_answer["text"] = "Found Jane."
+    cid = new_call(client)
+    body = {"transcript": "Customer: look me up at jane@example.com", "answer_mode": "full"}
+    r = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/transcript", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["frames"][0]["answer"]["mode"] == "full"
+
+
+def test_answer_mode_is_per_request(client):
+    fake_answer["text"] = "Found Jane."
+    cid = new_call(client)
+    turn(client, cid, "can you look me up")
+    body = {"utterance": "it's jane@example.com", "answer_mode": "full"}
+    frame = client.post(f"/v1/tenants/{TENANT}/calls/{cid}/turns", json=body).json()["slots"]["frames"][0]
+    # The turn that fires the tool decides, not the one that opened the frame.
+    assert frame["answer"]["mode"] == "full"
+
+
+def test_invalid_answer_mode_rejected(client):
+    body = {"utterance": "look me up at jane@example.com", "answer_mode": "verbose"}
+    assert_error(client.post(f"/v1/tenants/{TENANT}/calls/{new_call(client)}/turns", json=body), 422, "validation_error")
 
 
 def test_mock_tool_has_no_answer(client):
@@ -523,6 +566,19 @@ def test_responder_prune_and_fallback_render():
         "(2) first name John."
     )
     assert responder.render_fallback("search_zoho_lead", {"text": "No such lead."}) == "Zoho CRM Customer Lookup: No such lead."
+
+
+def test_responder_full_mode_limits():
+    data = {"data": [{"First_Name": f"Lead{i}", "Notes": "x" * 500} for i in range(8)]}
+    focused, full = responder.prune(data), responder.prune(data, "full")
+    assert len(focused["data"]) == 5 and len(focused["data"][0]["Notes"]) == 303
+    assert len(full["data"]) == 8 and full["data"][0]["Notes"] == "x" * 500
+    assert "Showing the first 3." in responder.render_fallback("search_zoho_lead", full)
+    assert "Showing the first" not in responder.render_fallback("search_zoho_lead", full, "full")
+    frame = state_store.Frame(id=1, intent="lookup_crm_record", status="FIRED",
+                              tool_call={"tool": "search_zoho_lead", "arguments": {}})
+    assert "holds 8 records" in responder._prompt(frame, full, "full")
+    assert "records" not in responder._prompt(frame, full, "focused").split("Rules:")[0]
 
 
 def test_responder_grounding_check():

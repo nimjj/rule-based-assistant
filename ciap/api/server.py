@@ -160,6 +160,16 @@ _USER_ID_FIELD = Field(
     description="The call agent's user ID. Optional; only recorded in the logs, never affects processing.",
 )
 
+AnswerMode = Literal["focused", "full"]
+_ANSWER_MODE_FIELD = Field(
+    default=None,
+    description=(
+        "How any tool this request fires gets its result explained in `answer`. `focused`: one or two "
+        "sentences answering what was asked. `full`: what was asked, then every record in the result and "
+        "its key details, in a short paragraph (slower). Defaults to `RESPONDER_DEFAULT_MODE` (`focused`)."
+    ),
+)
+
 
 class NewCallResponse(BaseModel):
     tenant_id: str = Field(..., examples=["acme"])
@@ -177,6 +187,7 @@ class TurnRequest(BaseModel):
         ),
     )
     user_id: UserId | None = _USER_ID_FIELD
+    answer_mode: AnswerMode | None = _ANSWER_MODE_FIELD
 
 
 class TranscriptTurn(BaseModel):
@@ -198,6 +209,7 @@ class TranscriptRequest(BaseModel):
         default=None, max_length=MAX_TRANSCRIPT_TURNS, description="Pre-parsed turns, in order."
     )
     user_id: UserId | None = _USER_ID_FIELD
+    answer_mode: AnswerMode | None = _ANSWER_MODE_FIELD
 
     @model_validator(mode="after")
     def _exactly_one(self):
@@ -281,10 +293,11 @@ class FrameView(BaseModel):
         description=(
             "`tool_result` as a short plain-English briefing for the agent, answering what was "
             "asked on the call: `{\"text\": ..., \"source\": \"llm\" | \"fallback\" | \"rule\", "
-            "\"model\": ..., \"note\": ...}`. `llm`: written by the responder model; `fallback`: "
-            "a plain listing of the result because the model failed, timed out or mentioned a value "
-            "not in the result (`note` says which); `rule`: a fixed sentence for `no_results` / "
-            "`error`. `model` is set for `llm` only. Null whenever `tool_result` is."
+            "\"model\": ..., \"note\": ..., \"mode\": \"focused\" | \"full\"}`. `llm`: written by the "
+            "responder model; `fallback`: a plain listing of the result because the model failed, timed "
+            "out or mentioned a value not in the result (`note` says which); `rule`: a fixed sentence for "
+            "`no_results` / `error`. `model` is set for `llm` only. `mode` is the request's `answer_mode` "
+            "on the turn that fired the tool. Null whenever `tool_result` is."
         ),
     )
 
@@ -583,12 +596,13 @@ async def _sweep_idle_calls_forever():
 
 
 def _run_turn(
-    key: CallKey, session: CallSession, text: str, speaker: str, user_id: str | None = None, debug: bool = False
+    key: CallKey, session: CallSession, text: str, speaker: str, user_id: str | None = None, debug: bool = False,
+    answer_mode: str | None = None,
 ) -> dict:
     """Process one turn under the call's lock. Caller holds no lock."""
     with session.lock:
         try:
-            trace = session.store.process_utterance(text, speaker=speaker)
+            trace = session.store.process_utterance(text, speaker=speaker, answer_mode=answer_mode)
         except Exception as exc:
             logger.exception("%s process_utterance failed on %r", _who(key, user_id), text)
             call_log.log_event(
@@ -775,13 +789,15 @@ def post_turn(
     `slots.frames[].tool_call` is set when a frame's required slots are all
     filled. Tools with a `remote` binding really execute on their MCP server
     (the shipped Zoho CRM lookups and the product tools); the response is `tool_result`,
-    and `answer` is that result as a briefing for the agent. The turn waits
-    for the call, up to `MCP_CALL_TIMEOUT_SECONDS`, then for the answer, up
-    to `RESPONDER_TIMEOUT_SECONDS`.
+    and `answer` is that result as a briefing for the agent: `answer_mode`
+    picks a `focused` one (just what was asked) or a `full` one (everything
+    useful in the result). The turn waits for the call, up to
+    `MCP_CALL_TIMEOUT_SECONDS`, then for the answer, up to
+    `RESPONDER_TIMEOUT_SECONDS` (`RESPONDER_FULL_TIMEOUT_SECONDS` for `full`).
     """
     key = (tenant_id, call_id)
     session = _get_or_create_session(key, source="turn", user_id=turn.user_id)
-    return _run_turn(key, session, turn.utterance, turn.speaker, turn.user_id, debug)
+    return _run_turn(key, session, turn.utterance, turn.speaker, turn.user_id, debug, turn.answer_mode)
 
 
 @app.post(
@@ -794,7 +810,8 @@ def post_transcript(tenant_id: TenantIdPath, call_id: CallIdPath, body: Transcri
     """Feed a whole transcript through the call, in order, as if each turn had
     been posted individually. Continues from the call's current state (use
     `/reset` first for a clean run), or starts the call if the ID is unknown.
-    Validated up front: nothing is processed (or created) if any turn is invalid."""
+    `answer_mode` applies to every turn. Validated up front: nothing is
+    processed (or created) if any turn is invalid."""
 
     if body.turns is not None:
         turns = [(t.speaker, t.utterance) for t in body.turns]
@@ -811,7 +828,9 @@ def post_transcript(tenant_id: TenantIdPath, call_id: CallIdPath, body: Transcri
 
     key = (tenant_id, call_id)
     session = _get_or_create_session(key, source="turn", user_id=body.user_id)
-    results = [_run_turn(key, session, text, speaker, body.user_id) for speaker, text in turns]
+    results = [
+        _run_turn(key, session, text, speaker, body.user_id, answer_mode=body.answer_mode) for speaker, text in turns
+    ]
     with session.lock:
         frames = views.frames_view(session.store)
     return {"tenant_id": tenant_id, "call_id": call_id, "turns": results, "frames": frames}

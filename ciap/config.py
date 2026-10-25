@@ -173,6 +173,16 @@ RESPONDER_MODEL_NAME = os.environ.get("RESPONDER_MODEL_NAME", "gemma4:e2b-it-qat
 # Override with the env var of the same name.
 RESPONDER_TIMEOUT_SECONDS = float(os.environ.get("RESPONDER_TIMEOUT_SECONDS", "20"))
 
+# The same wait for a "full" answer (see responder.MODES), which reads more of
+# the result and writes a paragraph rather than a sentence or two.
+# Override with the env var of the same name.
+RESPONDER_FULL_TIMEOUT_SECONDS = float(os.environ.get("RESPONDER_FULL_TIMEOUT_SECONDS", "40"))
+
+# The answer mode a turn gets when its request doesn't name one: "focused" or
+# "full" (see responder.MODES).
+# Override with the env var of the same name.
+RESPONDER_DEFAULT_MODE = os.environ.get("RESPONDER_DEFAULT_MODE", "focused")
+
 # How long Ollama keeps the responder model loaded after its last use, in
 # seconds; negative keeps it loaded for good. Ollama's own default unloads it
 # after 5 idle minutes, and reloading costs the next answer its timeout.

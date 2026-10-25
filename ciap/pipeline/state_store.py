@@ -44,6 +44,8 @@ class ConversationStateStore:
     def __init__(self):
         self.frames = []
         self._next_id = 1
+        # How the turn in progress wants tool results explained (responder.MODES).
+        self._answer_mode = config.RESPONDER_DEFAULT_MODE
 
     # -- frame helpers --------------------------------------------------
 
@@ -56,7 +58,7 @@ class ConversationStateStore:
     def _fire(self, frame):
         frame.tool_call = mcp_tools.build_tool_call(frame.intent, frame.slots)
         frame.tool_result = mcp_tools.dispatch_tool_call(frame.tool_call)
-        frame.answer = responder.compose_answer(frame)
+        frame.answer = responder.compose_answer(frame, self._answer_mode)
 
     def _pending_frame(self):
         for frame in reversed(self.frames):
@@ -100,6 +102,7 @@ class ConversationStateStore:
         frame.slots[slot_name] = value
         frame.missing_slots = [s for s in required if s not in frame.slots]
 
+        self._answer_mode = config.RESPONDER_DEFAULT_MODE
         refired = False
         if not frame.missing_slots:
             self._fire(frame)
@@ -170,15 +173,18 @@ class ConversationStateStore:
 
     # -- main entry point -------------------------------------------------
 
-    def process_utterance(self, utterance, speaker="customer"):
+    def process_utterance(self, utterance, speaker="customer", answer_mode=None):
         """Feed one utterance into the store, in speaking order. `speaker`
         is "customer" (default) or "agent" -- both run through the exact
         same intent-retrieval/confidence-band/frame logic below (an agent
         can be the one asking for something specific, or stating that an
         action is being taken, just as validly as a customer can). `speaker`
         only affects provenance: it rides along in the trace and becomes
-        `Frame.initiated_by` on any frame this turn opens. Returns a trace
+        `Frame.initiated_by` on any frame this turn opens. `answer_mode`
+        ("focused" or "full", default config.RESPONDER_DEFAULT_MODE) is how
+        any tool this turn fires gets its result explained. Returns a trace
         dict describing how the turn was handled, for the caller to display."""
+        self._answer_mode = answer_mode or config.RESPONDER_DEFAULT_MODE
         candidates = retrieve(utterance, top_k=config.RETRIEVAL_TOP_K)
         top_intent, top_score = candidates[0] if candidates else (None, 0.0)
         second_intent, second_score = candidates[1] if len(candidates) > 1 else (None, 0.0)

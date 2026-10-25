@@ -180,6 +180,7 @@ main {
 .speaker-btn.active { background: var(--accent); color: #fff; }
 #utterance {
   flex: 1;
+  min-width: 0;  /* else its default size pushes Send out past the two toggles */
   padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
