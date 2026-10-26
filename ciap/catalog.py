@@ -13,16 +13,19 @@
 # lives in server.py; this module checks the catalog's own consistency and
 # raises CatalogError for anything that would leave it broken.
 
+import copy
 import json
 import os
+import re
 import threading
 from pathlib import Path
 
-import config
-import embeddings
-from intents import INTENTS
-from mcp_tools import INTENT_TO_TOOL, TOOLS
-from slots import SLOT_EXTRACTORS
+from ciap import config
+from ciap.pipeline import embeddings
+from ciap.pipeline.intents import INTENTS
+from ciap.integrations import mcp_client
+from ciap.integrations.mcp_tools import INTENT_TO_TOOL, TOOLS, ZOHO_LEAD_SEARCH_REMOTE, placeholders
+from ciap.pipeline.slots import SLOT_EXTRACTORS
 
 # Serialises edits and the file write. Turns don't take it.
 lock = threading.RLock()
@@ -48,11 +51,18 @@ def load():
         INTENT_TO_TOOL.clear()
         TOOLS.clear()
         TOOLS.update(data["tools"])
-        # Catalogs saved before tools carried a "backend" marked Zoho live by
-        # its name; keep that tool live.
-        zoho = TOOLS.get("search_zoho_lead")
-        if zoho is not None and not any(t.get("backend") for t in TOOLS.values()):
-            TOOLS["search_zoho_lead"] = {**zoho, "backend": "zoho_lead_search"}
+        # Older catalogs marked the live Zoho tool with "backend":
+        # "zoho_lead_search", or (before that) only by its name. Either way it
+        # now runs through the Zoho MCP connection.
+        if not any(t.get("remote") for t in TOOLS.values()):
+            legacy = [n for n, t in TOOLS.items() if t.get("backend") == "zoho_lead_search"]
+            if not legacy and "search_zoho_lead" in TOOLS:
+                legacy = ["search_zoho_lead"]
+            for name in legacy:
+                TOOLS[name] = {**TOOLS[name], "remote": copy.deepcopy(ZOHO_LEAD_SEARCH_REMOTE)}
+        for name, spec in list(TOOLS.items()):
+            if "backend" in spec:
+                TOOLS[name] = {k: v for k, v in spec.items() if k != "backend"}
         for name, spec in data["intents"].items():
             INTENTS[name] = _intent_spec(spec.get("label"), spec["exemplars"], spec["required_slots"])
             if spec.get("tool"):
@@ -70,12 +80,12 @@ def _intent_spec(label, exemplars, required_slots):
     return spec
 
 
-def _tool_spec(label, description, input_schema, backend=None):
+def _tool_spec(label, description, input_schema, remote=None):
     spec = {"description": description, "inputSchema": input_schema}
     if label:
         spec["label"] = label
-    if backend:
-        spec["backend"] = backend
+    if remote:
+        spec["remote"] = remote
     return spec
 
 
@@ -120,6 +130,38 @@ def _check_tool_covered(tool, schema, intent, required_slots):
             f"Tool {tool!r} requires {uncovered}, which intent {intent!r} doesn't collect "
             f"(its required_slots are {required_slots}).",
         )
+
+
+_CONNECTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+
+
+def _check_remote(remote, schema):
+    connection, remote_tool = remote.get("connection"), remote.get("tool")
+    if not isinstance(connection, str) or not _CONNECTION_NAME.match(connection):
+        raise CatalogError(422, "invalid_remote", "remote.connection must be a connection name like \"zoho\".")
+    if not isinstance(remote_tool, str) or not remote_tool.strip():
+        raise CatalogError(422, "invalid_remote", "remote.tool must be the tool's name on the MCP server.")
+    allowed = mcp_client.allowed_tools(connection)
+    if allowed is not None and remote_tool not in allowed:
+        raise CatalogError(
+            422, "invalid_remote",
+            f"remote.tool {remote_tool!r} isn't in connection {connection!r}'s allowed_tools ({allowed}).",
+        )
+    arguments = remote.get("arguments")
+    if arguments is not None and not isinstance(arguments, dict):
+        raise CatalogError(422, "invalid_remote", "remote.arguments must be an object.")
+    unknown = sorted(placeholders(arguments) - set(schema["properties"]))
+    if unknown:
+        raise CatalogError(
+            422, "invalid_remote",
+            f"remote.arguments uses {unknown}, which aren't arguments of this tool "
+            f"(its input_schema has {sorted(schema['properties'])}).",
+        )
+    fallback = remote.get("fallback")
+    if fallback is not None:
+        if not isinstance(fallback, dict):
+            raise CatalogError(422, "invalid_remote", "remote.fallback must be a binding object.")
+        _check_remote(fallback, schema)
 
 
 def _check_schema(schema):
@@ -182,8 +224,13 @@ def delete_intent(name):
 # -- tools --------------------------------------------------------------------
 
 
-def put_tool(name, label, description, input_schema, create):
-    """Create (create=True) or replace a tool."""
+KEEP = object()
+
+
+def put_tool(name, label, description, input_schema, create, remote=KEEP):
+    """Create (create=True) or replace a tool. `remote` is its MCP binding
+    (None makes it a mock); an update that leaves it as KEEP keeps the
+    current one."""
     with lock:
         exists = name in TOOLS
         if create and exists:
@@ -194,9 +241,11 @@ def put_tool(name, label, description, input_schema, create):
         for intent, mapped in INTENT_TO_TOOL.items():
             if mapped == name:
                 _check_tool_covered(name, input_schema, intent, INTENTS[intent]["required_slots"])
-        # The backend isn't editable through the API; an update keeps it.
-        backend = TOOLS[name].get("backend") if exists else None
-        TOOLS[name] = _tool_spec(label, description, input_schema, backend)
+        if remote is KEEP:
+            remote = TOOLS[name].get("remote") if exists else None
+        if remote is not None:
+            _check_remote(remote, input_schema)
+        TOOLS[name] = _tool_spec(label, description, input_schema, remote)
         _save()
 
 

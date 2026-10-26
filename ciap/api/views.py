@@ -4,8 +4,8 @@
 # place that decides what a turn looks like to a consumer. Pure functions, no
 # I/O and no FastAPI, so they're testable without a server.
 
-from intents import INTENTS
-from mcp_tools import TOOLS
+from ciap.pipeline.intents import INTENTS
+from ciap.integrations.mcp_tools import TOOLS
 
 # turn_type (from state_store.process_utterance) -> a short decision label.
 # Coarser than turn_type, meant for badges / at-a-glance summaries.
@@ -85,6 +85,7 @@ def frame_view(frame, filled_this_turn=()):
         "filled_this_turn": list(filled_this_turn),
         "tool_call": tool_call_view(frame.tool_call),
         "tool_result": frame.tool_result,
+        "answer": frame.answer,
     }
 
 

@@ -28,10 +28,16 @@
           <button id="speaker-customer" type="button" class="speaker-btn active" data-speaker="Customer">Customer</button>
           <button id="speaker-agent" type="button" class="speaker-btn" data-speaker="Agent">Agent</button>
         </div>
+        <div class="speaker-toggle" role="group" aria-label="Answer mode">
+          <button id="mode-focused" type="button" class="speaker-btn active"
+                  title="Tool answers: one or two sentences answering what was asked">Focused</button>
+          <button id="mode-full" type="button" class="speaker-btn"
+                  title="Tool answers: what was asked, then every record and its key details (slower)">Full</button>
+        </div>
         <input id="utterance" type="text" autocomplete="off" spellcheck="false"
                placeholder="Type what they said and press Enter" />
         <button id="send" type="button">Send</button>
-        <span id="spinner" hidden>thinking&hellip;</span>
+        <span id="spinner" hidden>working&hellip;</span>
       </div>
     </section>
 
@@ -45,7 +51,7 @@
         <div class="panel-body"></div>
       </div>
       <div class="panel" id="panel-mcp">
-        <div class="panel-head"><span class="panel-num">3</span> MCP tool call</div>
+        <div class="panel-head"><span class="panel-num">3</span> MCP tool call &amp; answer</div>
         <div class="panel-body"></div>
       </div>
     </section>

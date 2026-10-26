@@ -8,7 +8,7 @@ import re
 
 import dateparser.search
 
-import config
+from ciap import config
 
 # Every regex below is built from config.py's knobs rather than hardcoded,
 # so tuning the accepted shapes (ID prefix, code length, cue words, ...)
@@ -51,6 +51,24 @@ _PRODUCT_NAME_RE = re.compile(
 )
 
 
+_PHONE_RE = re.compile(r"(?<![\w-])\+?\(?\d[\d\s().-]*\d(?![\w-])")
+
+# A company or deal name: a Title Case word, then more of them, optionally
+# joined by config.NAME_JOIN_WORDS ("Truhlar And Truhlar", "Bank of the West").
+_NAME_WORD = r"[A-Z][\w'&.-]*"
+_JOIN = "|".join(re.escape(w) for w in config.NAME_JOIN_WORDS)
+_ORG_NAME = rf"{_NAME_WORD}(?:\s+(?:(?i:{_JOIN})\s+)*{_NAME_WORD}){{0,{config.ORG_NAME_MAX_WORDS - 1}}}"
+
+
+def _cued(phrases):
+    return "|".join(re.escape(p) for p in sorted(phrases, key=len, reverse=True))
+
+
+_COMPANY_NAME_RE = re.compile(rf"\b(?i:{_cued(config.COMPANY_NAME_CUE_PHRASES)})\s+(?:(?i:the)\s+)?({_ORG_NAME})")
+_DEAL_NAME_BEFORE_RE = re.compile(rf"({_ORG_NAME})\s+(?i:deal)\b")
+_DEAL_NAME_AFTER_RE = re.compile(rf"\b(?i:{_cued(config.DEAL_NAME_CUE_PHRASES)})\s+(?:(?i:the)\s+)?({_ORG_NAME})")
+
+
 def extract_order_id(text):
     """ORD-NNNN if present, otherwise a bare order/account-style number."""
     match = _ORDER_ID_RE.search(text)
@@ -84,6 +102,32 @@ def extract_email(text):
     return match.group() if match else None
 
 
+def extract_phone(text):
+    """A phone number as said ("555-555-5555"); Zoho's phone search accepts
+    any format. Digit runs too short or long to be a phone number are skipped."""
+    for match in _PHONE_RE.finditer(text):
+        digits = sum(c.isdigit() for c in match.group())
+        if config.PHONE_MIN_DIGITS <= digits <= config.PHONE_MAX_DIGITS:
+            return match.group().strip()
+    return None
+
+
+def _clean_name(name):
+    # A sentence-initial "The" isn't part of the name.
+    name = re.sub(r"^The\s+", "", name.strip().rstrip(",.?!"))
+    return name or None
+
+
+def extract_company_name(text):
+    match = _COMPANY_NAME_RE.search(text)
+    return _clean_name(match.group(1)) if match else None
+
+
+def extract_deal_name(text):
+    match = _DEAL_NAME_BEFORE_RE.search(text) or _DEAL_NAME_AFTER_RE.search(text)
+    return _clean_name(match.group(1)) if match else None
+
+
 # dateparser's fuzzy search can match ordinary short words as dates (e.g.
 # "we" -> "Wednesday" in "...can we move it..."). Real date mentions in this
 # domain ("next Friday", "tomorrow", "March 3rd") are never this short, so
@@ -110,4 +154,7 @@ SLOT_EXTRACTORS = {
     "discount_code": extract_discount_code,
     "new_date": extract_date,
     "email": extract_email,
+    "phone": extract_phone,
+    "company_name": extract_company_name,
+    "deal_name": extract_deal_name,
 }

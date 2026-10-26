@@ -14,7 +14,9 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-LOG_DIR = Path(__file__).parent / "logs"
+from ciap import config
+
+LOG_DIR = Path(config.ROOT_DIR) / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 TURN_LOG = LOG_DIR / "turns.jsonl"
 

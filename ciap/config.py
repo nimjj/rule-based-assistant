@@ -4,12 +4,16 @@
 
 import os
 
+# The repository root: runtime files (data/, logs/, .env, connections.json)
+# live here, outside the ciap package.
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # Sentence embedding model used for intent retrieval (embeddings.py). Small
 # and CPU-friendly; swap this to retune retrieval quality/speed without
 # touching embeddings.py itself.
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
-# How many top-scoring intent candidates retrieve() returns. tools/gate.py and
+# How many top-scoring intent candidates retrieve() returns. scripts/gate.py and
 # state_store.py both consume this many; raising it gives multi-intent
 # detection more candidates to compare, at the cost of scoring more exemplars.
 RETRIEVAL_TOP_K = 3
@@ -89,12 +93,101 @@ PRODUCT_NAME_MIN_WORD_LEN = 2
 # Longest run of Title-Case words captured as a single product name.
 PRODUCT_NAME_MAX_WORDS = 5
 
+# Phone numbers: a run of digits, optionally with +, spaces, dashes, dots
+# or parentheses, holding this many digits in all ("555-555-5555",
+# "+1 (415) 555 0134"). Fewer is an order number or a year; more isn't a
+# phone number (E.164 caps at 15).
+PHONE_MIN_DIGITS = 7
+PHONE_MAX_DIGITS = 15
+
+# Company names are Title Case words cued by one of these phrases ("I'm
+# calling from Truhlar And Truhlar", "I work for King"). Lowercase joining
+# words in NAME_JOIN_WORDS may sit between the capitalized ones.
+COMPANY_NAME_CUE_PHRASES = [
+    "calling from", "calling on behalf of", "i'm with", "i am with", "we're with",
+    "i work at", "i work for", "company is", "company called", "account for", "from",
+]
+
+# Deal names are Title Case words right before "deal" ("the Commercial
+# Press deal") or after "deal for/with/called/named".
+DEAL_NAME_CUE_PHRASES = ["deal for", "deal with", "deal called", "deal named"]
+
+# Lowercase words allowed inside a company or deal name ("Truhlar and
+# Truhlar", "Bank of the West").
+NAME_JOIN_WORDS = ["and", "&", "of", "the"]
+
+# Longest run of words captured as a single company or deal name.
+ORG_NAME_MAX_WORDS = 6
+
 # -- catalog.py: admin-edited intent/tool catalog -----------------------------
 
 # Where edits made through the /v1/intents and /v1/tools write endpoints are
 # saved. Loaded over the defaults in intents.py / mcp_tools.py at startup when
 # present; delete it to go back to those defaults.
-CATALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "catalog.json")
+CATALOG_PATH = os.path.join(ROOT_DIR, "data", "catalog.json")
+
+# -- mcp_client.py: remote MCP servers for live tools -------------------------
+
+# Named MCP connections a tool's `remote` binding can use, e.g.
+#   {"zoho": {"url": "${ZOHO_MCP_URL}"},
+#    "other": {"url": "https://...", "headers": {"Authorization": "Bearer ${OTHER_TOKEN}"}}}
+# "${NAME}" is read from the environment (or .env), so secrets can stay out of
+# the file -- it's committed, so URLs with keys and tokens must always be
+# "${NAME}" references. The shipped connections.json has Zoho's hosted MCP
+# server, whose URL is a secret (ZOHO_MCP_URL). No file means no connections:
+# live tools then return a tool error instead of executing.
+# Override with the env var of the same name (e.g. an environment that needs
+# a different set of connections).
+MCP_CONNECTIONS_PATH = os.environ.get(
+    "MCP_CONNECTIONS_PATH",
+    os.path.join(ROOT_DIR, "connections.json"),
+)
+
+# Saved sign-ins for connections with "auth": {"type": "mcp_oauth"}, one
+# <name>.json per connection, written by `python scripts/connect.py <name>`
+# and refreshed by the server. They hold tokens: keep the folder out of git
+# (data/ is ignored) and readable only by the server's user. Sign in on any
+# machine with a browser and copy the file to the server.
+# Override with the env var of the same name.
+MCP_TOKENS_DIR = os.environ.get("MCP_TOKENS_DIR", os.path.join(ROOT_DIR, "data", "oauth"))
+
+# The longest a turn waits for a remote tool call (or a tool listing) before
+# giving up with a tool error. The turn response is held until then.
+# Override with the env var of the same name.
+MCP_CALL_TIMEOUT_SECONDS = float(os.environ.get("MCP_CALL_TIMEOUT_SECONDS", "5"))
+
+# -- responder.py: agent-facing answers for live tool results -----------------
+
+# The Ollama model that turns a live tool's JSON result into a short briefing
+# for the agent. Bigger than the escalation model (llm.py): summarizing
+# nested JSON faithfully needs more than picking from a list. Gemma 4 E2B
+# (quantization-aware build) beat gemma3:1b/4b on both accuracy and speed
+# for this, with thinking off (see responder._ask_model).
+# Override with the env var of the same name.
+RESPONDER_MODEL_NAME = os.environ.get("RESPONDER_MODEL_NAME", "gemma4:e2b-it-qat")
+
+# The longest a turn waits for that answer before falling back to a plain
+# listing of the result. On top of the tool call's own wait. 20s covers a
+# full Zoho lead record (~900 prompt tokens, ~14s) on a CPU-only box; on a
+# GPU an answer takes about a second, so this can come down there.
+# Override with the env var of the same name.
+RESPONDER_TIMEOUT_SECONDS = float(os.environ.get("RESPONDER_TIMEOUT_SECONDS", "20"))
+
+# The same wait for a "full" answer (see responder.MODES), which reads more of
+# the result and writes a paragraph rather than a sentence or two.
+# Override with the env var of the same name.
+RESPONDER_FULL_TIMEOUT_SECONDS = float(os.environ.get("RESPONDER_FULL_TIMEOUT_SECONDS", "40"))
+
+# The answer mode a turn gets when its request doesn't name one: "focused" or
+# "full" (see responder.MODES).
+# Override with the env var of the same name.
+RESPONDER_DEFAULT_MODE = os.environ.get("RESPONDER_DEFAULT_MODE", "focused")
+
+# How long Ollama keeps the responder model loaded after its last use, in
+# seconds; negative keeps it loaded for good. Ollama's own default unloads it
+# after 5 idle minutes, and reloading costs the next answer its timeout.
+# Override with the env var of the same name.
+RESPONDER_KEEP_ALIVE_SECONDS = float(os.environ.get("RESPONDER_KEEP_ALIVE_SECONDS", "-1"))
 
 # -- server.py: call memory ----------------------------------------------------
 
@@ -125,4 +218,5 @@ SLOT_OVERRIDE_ENABLED = _env_flag("SLOT_OVERRIDE_ENABLED")
 # The /demo page (static_demo/) is a dev/sales tool, not part of the product.
 # Off by default: /demo and its assets answer 404. Set the env var of the same
 # name to 1/true to serve it (e.g. on a dev or demo box).
-DEMO_UI_ENABLED = _env_flag("DEMO_UI_ENABLED")
+# DEMO_UI_ENABLED = _env_flag("DEMO_UI_ENABLED")
+DEMO_UI_ENABLED = 1

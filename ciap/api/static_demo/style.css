@@ -180,6 +180,7 @@ main {
 .speaker-btn.active { background: var(--accent); color: #fff; }
 #utterance {
   flex: 1;
+  min-width: 0;  /* else its default size pushes Send out past the two toggles */
   padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -412,6 +413,8 @@ main {
 }
 .mcp-result { border-top: 1px solid #ddc9f7; }
 .mcp-result-head {
+  cursor: pointer;
+  list-style-position: inside;
   background: var(--good);
   color: #fff;
   font-weight: 700;
@@ -427,6 +430,75 @@ main {
   font-size: 13px;
   overflow-x: auto;
 }
+.mcp-result-status {
+  float: right;
+  font-weight: 400;
+  opacity: 0.85;
+  text-transform: lowercase;
+}
+
+/* The agent-facing answer (responder.py): blue when the model wrote it,
+   amber for a fallback listing, grey for a fixed no-results/error message. */
+.mcp-answer { --answer: var(--accent); --answer-bg: #e7eefc; border-bottom: 1px solid #ddc9f7; }
+.mcp-answer-head {
+  background: var(--answer);
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  padding: 8px 12px;
+}
+.mcp-answer-source {
+  float: right;
+  font-weight: 400;
+  letter-spacing: 0;
+  opacity: 0.9;
+}
+.mcp-answer p {
+  margin: 0;
+  padding: 12px;
+  background: var(--answer-bg);
+  font-size: 16px;
+  line-height: 1.5;
+}
+.mcp-answer-note {
+  padding: 0 12px 10px;
+  background: var(--answer-bg);
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+/* The same answer, inline in the transcript under the turn that fired it. */
+.answer-card {
+  --answer: var(--accent);
+  --answer-bg: #e7eefc;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: -2px 0 2px 38px;
+  padding: 8px 12px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: var(--answer-bg);
+  border: 1px solid transparent;
+  border-left: 4px solid var(--answer);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.answer-card.active { border-color: var(--answer); border-left-width: 4px; }
+.answer-card-head {
+  color: var(--answer);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.answer-card-text { font-size: 15px; }
+
+/* After both blocks above, so the variants override their default blue. */
+.answer-fallback { --answer: var(--wait); --answer-bg: var(--wait-bg); }
+.answer-rule { --answer: var(--miss); --answer-bg: #f0f1f3; }
 .mcp-history-head {
   margin-top: 14px;
   font-size: 12px;

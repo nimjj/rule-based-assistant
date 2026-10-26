@@ -20,7 +20,7 @@ import json
 
 import ollama
 
-from intents import INTENTS
+from ciap.pipeline.intents import INTENTS
 
 MODEL_NAME = "gemma3:1b"
 
