@@ -5,7 +5,8 @@
 # briefing for the call agent, answering what was asked on the call -- with
 # no per-tool setup, so a newly bound MCP tool gets answers on day one:
 #   - no_results / error: a fixed sentence, no model call
-#   - success: the LLM writes 1-2 sentences from the (pruned) data; if the
+#   - success: the LLM writes 1-2 sentences from the data (records matching
+#     the lookup first, then pruned to the mode's limits); if the
 #     call fails, times out, or the answer mentions an email or number that
 #     isn't in the data or the question, a generic renderer lists the
 #     record's fields instead.
@@ -93,6 +94,53 @@ def prune(value, mode="focused"):
         cap = limits["max_string_chars"]
         return value if len(value) <= cap else value[:cap] + "..."
     return value
+
+
+def _scalars(value):
+    # Every non-container value in a record, however deeply nested.
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _scalars(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _scalars(item)
+    elif value is not None:
+        yield value
+
+
+def _match_score(record, wanted):
+    """How well a record matches the lookup arguments: per argument, 2 for a
+    field equal to it, 1 for a field containing it. Case-insensitive; values
+    with 7+ digits (phone numbers) compare on digits alone, ignoring a
+    country code or formatting on either side."""
+    fields = [str(v).strip().casefold() for v in _scalars(record)]
+    digits = [d for d in (re.sub(r"\D", "", f) for f in fields) if len(d) >= 7]
+    score = 0
+    for arg in wanted:
+        arg_digits = re.sub(r"\D", "", arg)
+        if len(arg_digits) >= 7 and any(d.endswith(arg_digits) or arg_digits.endswith(d) for d in digits):
+            score += 2
+        elif arg in fields:
+            score += 2
+        elif len(arg) >= 3 and any(arg in f for f in fields):
+            score += 1
+    return score
+
+
+def rank_records(data, arguments):
+    """The result with its records reordered so those matching the lookup
+    arguments come first (otherwise in the server's order), so the list
+    limits below never drop the record that was asked about in favor of
+    ones that weren't. Uses only the values, never field names, so it works
+    for any server's result shape."""
+    if not isinstance(data, dict) or not arguments:
+        return data
+    wanted = [str(v).strip().casefold() for v in _scalars(arguments) if str(v).strip()]
+    for key, value in data.items():
+        if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+            ranked = sorted(value, key=lambda record: -_match_score(record, wanted))
+            return {**data, key: ranked}
+    return data
 
 
 def as_text(value, indent=0):
@@ -265,7 +313,7 @@ def compose_answer(frame, mode="focused"):
     if result["status"] == "error":
         return _answer(f"{label} couldn't be completed ({result['message']}).", "rule", mode)
 
-    data = prune(result["data"], mode) or {}
+    data = prune(rank_records(result["data"], frame.tool_call["arguments"]), mode) or {}
     try:
         text = _ask_model(_prompt(frame, data, mode), mode)
     except Exception as exc:

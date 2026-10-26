@@ -581,6 +581,44 @@ def test_responder_full_mode_limits():
     assert "records" not in responder._prompt(frame, full, "focused").split("Rules:")[0]
 
 
+@pytest.mark.parametrize("data, key, arguments, first", [
+    # Zoho: {"data": [...]}, flat fields
+    ({"data": [{"Email": f"lead{i}@example.com"} for i in range(8)]}, "data",
+     {"email": "LEAD6@example.com"}, {"Email": "lead6@example.com"}),
+    # HubSpot: {"results": [...]}, fields nested under "properties"
+    ({"results": [{"id": str(i), "properties": {"email": f"c{i}@example.com"}} for i in range(12)]}, "results",
+     {"email": "c11@example.com"}, {"id": "11", "properties": {"email": "c11@example.com"}}),
+    # Salesforce: {"records": [...]}, phone formatted differently from the lookup
+    ({"totalSize": 7, "records": [{"Name": f"Acct {i}", "Phone": f"(555) 010-12{i:02d}"} for i in range(7)]}, "records",
+     {"phone": "+1 555 010 1206"}, {"Name": "Acct 6", "Phone": "(555) 010-1206"}),
+])
+def test_responder_ranks_matching_records_first(data, key, arguments, first):
+    ranked = responder.rank_records(data, arguments)
+    assert ranked[key][0] == first and len(ranked[key]) == len(data[key])
+    assert responder.prune(ranked)[key][0] == first  # survives the focused list limit
+
+
+def test_responder_ranking_keeps_server_order_otherwise():
+    data = {"data": [{"Name": "Rangoni Of Florence"}, {"Name": "Kidman"}, {"Name": "Rangoni"}, {"Name": "Acme"}]}
+    # an exact match beats a partial one; ties keep the server's order
+    assert [r["Name"] for r in responder.rank_records(data, {"name": "rangoni"})["data"]] == [
+        "Rangoni", "Rangoni Of Florence", "Kidman", "Acme"]
+    assert responder.rank_records(data, {"name": "nobody"}) == data
+    assert responder.rank_records(data, {}) == data
+    assert responder.rank_records({"text": "No such lead."}, {"email": "a@b.co"}) == {"text": "No such lead."}
+
+
+def test_responder_prompt_sees_match_past_list_limit(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(responder, "_ask_model", lambda prompt, mode="focused": prompts.append(prompt) or "ok")
+    frame = state_store.Frame(id=1, intent="lookup_crm_record", status="FIRED",
+                              tool_call={"tool": "search_zoho_lead", "arguments": {"email": "lead7@example.com"}})
+    frame.tool_result = {"status": "success", "message": None,
+                         "data": {"data": [{"Email": f"lead{i}@example.com"} for i in range(8)]}}
+    assert responder.compose_answer(frame)["source"] == "llm"
+    assert "lead7@example.com" in prompts[0].split("Result:")[1]
+
+
 def test_responder_grounding_check():
     data = {"amount": 1499.0, "email": "Jane@Example.com"}
     assert responder.ungrounded_values("Paid 1,499 by jane@example.com.", data) == []
