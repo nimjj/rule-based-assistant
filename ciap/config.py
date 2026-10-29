@@ -189,6 +189,30 @@ RESPONDER_DEFAULT_MODE = os.environ.get("RESPONDER_DEFAULT_MODE", "focused")
 # Override with the env var of the same name.
 RESPONDER_KEEP_ALIVE_SECONDS = float(os.environ.get("RESPONDER_KEEP_ALIVE_SECONDS", "-1"))
 
+# How many of a result list's items are compared by meaning to what was said
+# on the call, to pick what the answer model sees (see responder.Relevance);
+# exact lookup matches are found in every item regardless. Each item costs
+# ~15ms to embed on a CPU-only laptop (i7-1355U), so 50 caps it near 1s;
+# raise it on faster hardware.
+# Override with the env var of the same name.
+RESPONDER_MAX_SCORED_ITEMS = int(os.environ.get("RESPONDER_MAX_SCORED_ITEMS", "50"))
+
+# Whether a tool's result is pruned before the answer model sees it (the
+# items and passages closest to the call, within responder.LIMITS). "false"
+# sends the result exactly as the server returned it -- nothing dropped,
+# reordered or reformatted -- which is slower (every token is read) and needs
+# a large enough RESPONDER_NUM_CTX.
+# Override with the env var of the same name.
+RESPONDER_PRUNE_RESULTS = os.environ.get("RESPONDER_PRUNE_RESULTS", "true").strip().lower() not in ("0", "false", "no")
+
+# The answer model's context window in tokens (Ollama's num_ctx); a prompt
+# longer than it would be silently cut from the start, so a result that
+# can't fit gets the plain listing instead. Unset: Ollama's own default when
+# pruning (pruned prompts are small), 32768 when not. gemma4:e2b reads up
+# to 131072; a bigger window costs memory, not speed.
+# Override with the env var of the same name.
+RESPONDER_NUM_CTX = int(os.environ.get("RESPONDER_NUM_CTX") or (0 if RESPONDER_PRUNE_RESULTS else 32768)) or None
+
 # -- server.py: call memory ----------------------------------------------------
 
 # A call with no activity (turn, transcript, slot override, reset) for this

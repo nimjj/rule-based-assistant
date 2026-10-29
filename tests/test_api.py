@@ -592,20 +592,81 @@ def test_responder_full_mode_limits():
     ({"totalSize": 7, "records": [{"Name": f"Acct {i}", "Phone": f"(555) 010-12{i:02d}"} for i in range(7)]}, "records",
      {"phone": "+1 555 010 1206"}, {"Name": "Acct 6", "Phone": "(555) 010-1206"}),
 ])
-def test_responder_ranks_matching_records_first(data, key, arguments, first):
-    ranked = responder.rank_records(data, arguments)
-    assert ranked[key][0] == first and len(ranked[key]) == len(data[key])
-    assert responder.prune(ranked)[key][0] == first  # survives the focused list limit
+def test_responder_exact_lookup_match_kept_first(data, key, arguments, first):
+    relevance = responder.Relevance("can you pull up my account", arguments)
+    pruned = responder.prune(data, "focused", relevance)
+    assert pruned[key][0] == first and len(pruned[key]) == 5  # survives the focused list limit
+    assert pruned[key].total == len(data[key]) and pruned[key].positions[0] == data[key].index(first) + 1
 
 
-def test_responder_ranking_keeps_server_order_otherwise():
+def test_responder_exact_match_beats_partial():
     data = {"data": [{"Name": "Rangoni Of Florence"}, {"Name": "Kidman"}, {"Name": "Rangoni"}, {"Name": "Acme"}]}
-    # an exact match beats a partial one; ties keep the server's order
-    assert [r["Name"] for r in responder.rank_records(data, {"name": "rangoni"})["data"]] == [
-        "Rangoni", "Rangoni Of Florence", "Kidman", "Acme"]
-    assert responder.rank_records(data, {"name": "nobody"}) == data
-    assert responder.rank_records(data, {}) == data
-    assert responder.rank_records({"text": "No such lead."}, {"email": "a@b.co"}) == {"text": "No such lead."}
+    pruned = responder.prune(data, "focused", responder.Relevance("look up the account", {"name": "rangoni"}))
+    assert [r["Name"] for r in pruned["data"][:2]] == ["Rangoni", "Rangoni Of Florence"]
+    assert pruned["data"].positions[:2] == [3, 1]
+
+
+def test_responder_keeps_records_closest_in_meaning():
+    # nothing in the question matches a value exactly: the closed deal is 8th of 8
+    deals = [{"Deal_Name": f"Order {i}", "Stage": "Qualification", "Amount": 1000 + i} for i in range(7)]
+    deals.append({"Deal_Name": "Order 7", "Stage": "Closed Won", "Amount": 5400})
+    pruned = responder.prune({"data": deals}, "focused",
+                             responder.Relevance("which of his deals did we close and win?", {"name": "Acme"}))
+    assert pruned["data"][0]["Stage"] == "Closed Won" and pruned["data"].positions[0] == 8
+
+
+def test_responder_long_text_keeps_passages_about_the_call():
+    notes = ("Called about the spring catalogue and wanted samples of the oak range. " * 4
+             + "He said the delivery must arrive before the 14th or he will cancel the order. "
+             + "Prefers email over phone calls for follow ups. " * 4)
+    relevance = responder.Relevance("what did he say about the delivery date?")
+    excerpt = responder.prune({"Notes": notes}, "focused", relevance)["Notes"]
+    assert "delivery must arrive before the 14th" in excerpt
+    assert len(excerpt) <= 300 + 20 and "..." in excerpt
+    assert responder.prune({"Notes": notes})["Notes"] == notes[:300] + "..."  # no question: the first 300
+
+
+def test_responder_prompt_says_what_was_left_out():
+    rows = [{"Product": f"Item {i}", "Status": "Shipped"} for i in range(8)]
+    rows[6]["Status"] = "Backordered"
+    pruned = responder.prune({"lines": rows}, "focused", responder.Relevance("which item is backordered?"))
+    text = responder.as_text(pruned)
+    assert "showing 5 of 8, most relevant to the call first" in text and "- item 7:" in text
+    plain = responder.as_text(responder.prune({"lines": rows}))
+    assert "showing 5 of 8, the first ones" in plain and "- item 7:" not in plain
+
+
+def test_responder_finds_records_nested_deep_and_keeps_tag_order():
+    data = {"response": {"result": {"items": [{"email": f"u{i}@example.com"} for i in range(9)]}},
+            "tags": [f"tag{i}" for i in range(9)]}
+    pruned = responder.prune(data, "focused", responder.Relevance("look me up", {"email": "u8@example.com"}))
+    assert pruned["response"]["result"]["items"][0] == {"email": "u8@example.com"}
+    assert pruned["tags"].positions == sorted(pruned["tags"].positions) and len(pruned["tags"]) == 5
+
+
+def test_responder_fallback_counts_the_whole_result():
+    data = {"data": [{"Email": f"lead{i}@example.com"} for i in range(8)]}
+    ranked = responder.prune(data, "focused", responder.Relevance("find me", {"email": "lead7@example.com"}))
+    rendered = responder.render_fallback("search_zoho_lead", ranked)
+    assert rendered.startswith("Zoho CRM Customer Lookup found 8 results: (1) email lead7@example.com.")
+    assert rendered.endswith("Showing the 3 most relevant.")
+    assert responder.render_fallback("search_zoho_lead", responder.prune(data)).endswith("Showing the first 3.")
+
+
+def test_responder_relevance_edge_cases():
+    data = {"data": [{"Name": "Zoë Åström", "Note": "日本語のメモ"}, {"Name": "Ann"}]}
+    for question in ("", "   ", "¿dónde está mi pedido?", "x" * 5000):
+        pruned = responder.prune(data, "focused", responder.Relevance(question, {"name": "Ann"}))
+        assert pruned["data"][0] == {"Name": "Ann"} and len(pruned["data"]) == 2
+    assert responder.prune({"data": []}, "focused", responder.Relevance("hi")) is None
+    assert responder.prune({"data": [{}, {"x": ""}]}, "focused", responder.Relevance("hi")) is None
+    one_sentence = "word " * 200  # no sentence breaks: plain cut
+    assert responder.prune({"t": one_sentence}, "focused", responder.Relevance("word"))["t"].endswith("...")
+    # an exact match is found anywhere; only the first MAX_SCORED_ITEMS are compared by meaning
+    big = {"data": [{"email": f"u{i}@example.com"} for i in range(1000)]}
+    pruned = responder.prune(big, "focused", responder.Relevance("find me", {"email": "u999@example.com"}))
+    assert pruned["data"].total == 1000 and pruned["data"].positions[0] == 1000
+    assert max(pruned["data"].positions[1:]) <= responder.MAX_SCORED_ITEMS
 
 
 def test_responder_prompt_sees_match_past_list_limit(monkeypatch):
@@ -617,6 +678,47 @@ def test_responder_prompt_sees_match_past_list_limit(monkeypatch):
                          "data": {"data": [{"Email": f"lead{i}@example.com"} for i in range(8)]}}
     assert responder.compose_answer(frame)["source"] == "llm"
     assert "lead7@example.com" in prompts[0].split("Result:")[1]
+
+
+def _raw_frame(data):
+    frame = state_store.Frame(id=1, intent="lookup_crm_record", status="FIRED",
+                              tool_call={"tool": "search_zoho_lead", "arguments": {"email": "lead7@example.com"}},
+                              utterances=[{"speaker": "customer", "text": "look me up"}])
+    frame.tool_result = {"status": "success", "message": None, "data": data}
+    return frame
+
+
+def test_responder_unpruned_sends_the_raw_result(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(responder, "_ask_model", lambda prompt, mode="focused": prompts.append(prompt) or "ok")
+    monkeypatch.setattr(config, "RESPONDER_PRUNE_RESULTS", False)
+    monkeypatch.setattr(config, "RESPONDER_NUM_CTX", 32768)
+    data = {"data": [{"id": str(i), "$approval": {"delegate": False}, "Email": f"lead{i}@example.com",
+                      "Notes": "x" * 2000, "Company": ""} for i in range(12)]}
+    assert responder.compose_answer(_raw_frame(data))["source"] == "llm"
+    assert prompts[0].split("Result:\n")[1].split("\n\nRespond")[0] == json.dumps(data)  # untouched
+    assert "left out" not in prompts[0]
+    assert responder._context_option() == {"num_ctx": 32768}
+    # a bare list or string result is sent too
+    responder.compose_answer(_raw_frame(["a", "b"]))
+    assert '{"result": ["a", "b"]}' in prompts[1]
+
+
+def test_responder_unpruned_result_too_big_for_context(monkeypatch):
+    monkeypatch.setattr(responder, "_ask_model", lambda *a: pytest.fail("model must not be called"))
+    monkeypatch.setattr(config, "RESPONDER_PRUNE_RESULTS", False)
+    monkeypatch.setattr(config, "RESPONDER_NUM_CTX", 2048)
+    data = {"data": [{"$approval": {"delegate": False}, "Email": f"lead{i}@example.com", "Notes": "y" * 900}
+                     for i in range(12)]}
+    answer = responder.compose_answer(_raw_frame(data))
+    assert answer["source"] == "fallback" and "too large for the model's context" in answer["note"]
+    assert answer["text"].startswith("Zoho CRM Customer Lookup found 12 results:") and "approval" not in answer["text"]
+
+
+def test_responder_pruned_by_default_with_ollama_context(monkeypatch):
+    monkeypatch.setattr(config, "RESPONDER_NUM_CTX", None)
+    assert config.RESPONDER_PRUNE_RESULTS is True and responder._context_option() == {}
+    assert responder._fits_context("z" * 10**6, "full")
 
 
 def test_responder_grounding_check():
