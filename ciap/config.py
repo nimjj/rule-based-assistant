@@ -119,11 +119,11 @@ NAME_JOIN_WORDS = ["and", "&", "of", "the"]
 # Longest run of words captured as a single company or deal name.
 ORG_NAME_MAX_WORDS = 6
 
-# -- catalog.py: admin-edited intent/tool catalog -----------------------------
+# -- catalog.py: admin-edited intent catalog ----------------------------------
 
-# Where edits made through the /v1/intents and /v1/tools write endpoints are
-# saved. Loaded over the defaults in intents.py / mcp_tools.py at startup when
-# present; delete it to go back to those defaults.
+# Where edits made through the /v1/intents write endpoints are saved. Loaded
+# over the defaults in intents.py at startup when present; delete it to go
+# back to those defaults.
 CATALOG_PATH = os.path.join(ROOT_DIR, "data", "catalog.json")
 
 # -- mcp_client.py: remote MCP servers for live tools -------------------------

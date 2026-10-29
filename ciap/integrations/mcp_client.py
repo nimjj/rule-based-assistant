@@ -1,5 +1,6 @@
-# Real MCP client for live tools: a tool whose catalog entry has a `remote`
-# binding (mcp_tools.py) is executed by calling a tool on a remote MCP server.
+# Real MCP client for live tools: an intent whose catalog entry has a
+# `remote` binding (intents.py, mcp_tools.py) has its tool call executed by
+# calling a tool on a remote MCP server.
 # Everything that differs between CRMs' MCP servers is per-connection config
 # in config.MCP_CONNECTIONS_PATH (see ConnectionSpec below), so onboarding a
 # CRM is a config change, not a code change:
