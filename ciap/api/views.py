@@ -5,7 +5,6 @@
 # I/O and no FastAPI, so they're testable without a server.
 
 from ciap.pipeline.intents import INTENTS
-from ciap.integrations.mcp_tools import TOOLS
 
 # turn_type (from state_store.process_utterance) -> a short decision label.
 # Coarser than turn_type, meant for badges / at-a-glance summaries.
@@ -38,17 +37,12 @@ def intent_label(name):
     return INTENTS.get(name, {}).get("label") or humanize(name)
 
 
-def tool_label(name):
-    if name is None:
-        return None
-    return TOOLS.get(name, {}).get("label") or humanize(name)
-
-
 def tool_call_view(tool_call):
-    """A tool call with its display label alongside the tool name."""
+    """A tool call with its display label alongside the tool name. A tool
+    call is named after the intent that fired it, so that's its label too."""
     if not tool_call:
         return tool_call
-    return {**tool_call, "tool_label": tool_label(tool_call.get("tool"))}
+    return {**tool_call, "tool_label": intent_label(tool_call.get("tool"))}
 
 
 def slot_display(value):

@@ -24,8 +24,8 @@ import re
 import ollama
 
 from ciap import config
-from ciap.integrations.mcp_tools import TOOLS
 from ciap.pipeline import embeddings
+from ciap.pipeline.intents import INTENTS
 
 MODEL_NAME = config.RESPONDER_MODEL_NAME
 
@@ -74,8 +74,14 @@ INSTRUCTIONS = {
 }
 
 
+# A tool call is named after the intent that fired it.
 def _tool_label(name):
-    return TOOLS.get(name, {}).get("label") or name.replace("_", " ").title()
+    return INTENTS.get(name, {}).get("label") or name.replace("_", " ").title()
+
+
+def _tool_line(name):
+    description = INTENTS.get(name, {}).get("description")
+    return f"{_tool_label(name)} -- {description}" if description else _tool_label(name)
 
 
 def _answer(text, source, mode, note=None):
@@ -300,7 +306,7 @@ def _prompt(frame, data, mode="focused", pruned=True):
         "Don't mention field names or the lookup itself. If the result "
         f"doesn't answer what was asked, say what it does show.{left_out}\n\n"
         f"What was said on the call:\n{_question(frame)}\n\n"
-        f"Lookup: {_tool_label(tool)} -- {TOOLS.get(tool, {}).get('description', '')}\n"
+        f"Lookup: {_tool_line(tool)}\n"
         f"Lookup arguments: {json.dumps(frame.tool_call['arguments'], ensure_ascii=False)}\n"
         f"Result:\n{payload}\n\n"
         'Respond with a JSON object: {"answer": "<your briefing for the agent>"}.'

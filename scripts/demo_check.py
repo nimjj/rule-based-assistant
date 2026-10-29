@@ -66,8 +66,8 @@ def check_pipeline_end_to_end():
     store.process_utterance("Where is my order")
     trace = store.process_utterance("ORD-48213")
     calls = trace.get("tool_calls") or []
-    if not calls or calls[0].get("tool") != "get_order_status":
-        raise RuntimeError(f"expected a get_order_status tool call, got {calls!r}")
+    if not calls or calls[0].get("tool") != "track_order":
+        raise RuntimeError(f"expected a track_order tool call, got {calls!r}")
     if calls[0]["arguments"].get("order_id") != "ORD-48213":
         raise RuntimeError(f"order_id not extracted into the tool call: {calls[0]!r}")
 

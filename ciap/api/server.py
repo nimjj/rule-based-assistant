@@ -36,7 +36,7 @@ from ciap.integrations import mcp_client
 from ciap.api import views
 from ciap.api.demo_web import router as demo_router
 from ciap.pipeline.intents import INTENTS
-from ciap.integrations.mcp_tools import INTENT_TO_TOOL, TOOLS, executes_live
+from ciap.integrations.mcp_tools import executes_live
 from ciap.pipeline.slots import SLOT_EXTRACTORS
 from ciap.pipeline.state_store import ConversationStateStore
 from ciap.pipeline.transcripts import parse_turns
@@ -276,7 +276,10 @@ class FrameView(BaseModel):
     )
     tool_call: dict | None = Field(
         default=None,
-        description='`{"tool": ..., "tool_label": ..., "arguments": {...}}`, set once the frame is FIRED.',
+        description=(
+            '`{"tool": ..., "tool_label": ..., "arguments": {...}}`, set once the frame is FIRED. '
+            "`tool` is the intent's name and `arguments` its required slots."
+        ),
     )
     tool_result: dict | None = Field(
         default=None,
@@ -339,22 +342,14 @@ class TranscriptResponse(BaseModel):
 
 
 class IntentInfo(BaseModel):
-    name: str
+    name: str = Field(..., description="Also the name of the tool call the intent fires.")
     label: str = Field(..., description="Display name. Show this in UIs; `name` is the ID.")
+    description: str | None = Field(..., description="What the intent's tool call does, or null if not set.")
     required_slots: list[str]
-    tool: str | None
     exemplar_count: int
     exemplars: list[str]
-
-
-class ToolInfo(BaseModel):
-    name: str
-    label: str = Field(..., description="Display name. Show this in UIs; `name` is the ID.")
-    description: str
-    input_schema: dict
-    intents: list[str] = Field(..., description="Intents that fire this tool.")
-    executes_live: bool = Field(..., description="True if the tool has a `remote` binding and really runs; false if it's a mock.")
-    remote: dict | None = Field(None, description="How the tool executes on a remote MCP server, or null for a mock (see `RemoteBinding`).")
+    executes_live: bool = Field(..., description="True if the intent has a `remote` binding and really runs; false if it's a mock.")
+    remote: dict | None = Field(None, description="How the tool call executes on a remote MCP server, or null for a mock (see `RemoteBinding`).")
 
 
 CatalogName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
@@ -366,27 +361,8 @@ _LABEL_FIELD_DESCRIPTION = (
 )
 
 
-class IntentUpdate(BaseModel):
-    label: Label | None = Field(default=None, description=_LABEL_FIELD_DESCRIPTION)
-    exemplars: list[Exemplar] = Field(
-        ..., min_length=1, max_length=200,
-        description="Phrasings retrieval matches against. Re-embedded on the next turn after a change.",
-    )
-    required_slots: list[str] = Field(
-        default_factory=list, description="Slots collected before the tool fires. Each must be in `GET /v1/slots`."
-    )
-    tool: str | None = Field(
-        default=None,
-        description="Tool this intent fires, or null for none. The tool's required arguments must all be in `required_slots`.",
-    )
-
-
-class IntentCreate(IntentUpdate):
-    name: CatalogName = Field(..., description="Lowercase snake_case. Change it later with `POST /v1/intents/{name}/rename`.")
-
-
 class RemoteBinding(BaseModel):
-    """Runs the tool as a call to a tool on a remote MCP server."""
+    """Runs the intent's tool call as a call to a tool on a remote MCP server."""
 
     connection: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$")] = Field(
         ..., description="A connection configured in the MCP connections file (see `GET /v1/connections`)."
@@ -397,9 +373,9 @@ class RemoteBinding(BaseModel):
     arguments: dict | None = Field(
         None,
         description=(
-            "What to send the remote tool. `{name}` inside a string is replaced by this tool's argument "
+            "What to send the remote tool. `{name}` inside a string is replaced by the intent's slot "
             "of that name; a value that is exactly `\"{name}\"` passes it through as-is; anything else "
-            "is sent unchanged. Omit to send this tool's arguments as they are."
+            "is sent unchanged. Omit to send the intent's slots as they are."
         ),
         examples=[{"module": "Leads", "criteria": "(Email:equals:{email})"}],
     )
@@ -415,27 +391,31 @@ class RemoteBinding(BaseModel):
 RemoteBinding.model_rebuild()
 
 
-class ToolUpdate(BaseModel):
+class IntentUpdate(BaseModel):
     label: Label | None = Field(default=None, description=_LABEL_FIELD_DESCRIPTION)
-    description: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
-    input_schema: dict = Field(
-        ...,
-        description=(
-            'JSON Schema: `{"type": "object", "properties": {...}, "required": [...]}`. '
-            "Arguments are filled from the firing intent's slots by property name."
-        ),
+    description: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)] | None = Field(
+        default=None,
+        description="What the intent's tool call does. The responder briefs the model with it when explaining a result.",
+    )
+    exemplars: list[Exemplar] = Field(
+        ..., min_length=1, max_length=200,
+        description="Phrasings retrieval matches against. Re-embedded on the next turn after a change.",
+    )
+    required_slots: list[str] = Field(
+        default_factory=list,
+        description="Slots collected before the tool call fires; they become its arguments. Each must be in `GET /v1/slots`.",
     )
     remote: RemoteBinding | None = Field(
         None,
         description=(
-            "Run the tool on a remote MCP server. On create, omit it for a mock. On update, "
-            "omit it to keep the current binding, or send null to make the tool a mock."
+            "Run the tool call on a remote MCP server. On create, omit it for a mock. On update, "
+            "omit it to keep the current binding, or send null to make the intent a mock."
         ),
     )
 
 
-class ToolCreate(ToolUpdate):
-    name: CatalogName = Field(..., description="Lowercase snake_case. Change it later with `POST /v1/tools/{name}/rename`.")
+class IntentCreate(IntentUpdate):
+    name: CatalogName = Field(..., description="Lowercase snake_case. Change it later with `POST /v1/intents/{name}/rename`.")
 
 
 class RenameRequest(BaseModel):
@@ -662,7 +642,7 @@ app = FastAPI(
     lifespan=lifespan,
     openapi_tags=[
         {"name": "calls", "description": "Call lifecycle and turns."},
-        {"name": "catalog", "description": "Intent and tool catalogs."},
+        {"name": "catalog", "description": "The intent catalog: what each intent recognises, collects and fires."},
         {"name": "ops", "description": "Logging and health."},
         {
             "name": "archived",
@@ -712,7 +692,7 @@ async def _unhandled_error_handler(request: Request, exc: Exception):
 
 _NOT_FOUND = {404: {"model": ErrorResponse, "description": "No such call (`call_not_found`), or it expired from inactivity (`call_expired`)."}}
 _INVALID = {422: {"model": ErrorResponse, "description": "Request failed validation."}}
-_CATALOG_NOT_FOUND = {404: {"model": ErrorResponse, "description": "No such intent/tool."}}
+_CATALOG_NOT_FOUND = {404: {"model": ErrorResponse, "description": "No such intent."}}
 _CONFLICT = {409: {"model": ErrorResponse, "description": "Conflicts with the current catalog or live calls."}}
 
 
@@ -787,8 +767,8 @@ def post_turn(
     | `slot_override` | override | Produced by the archived `PATCH .../slots/{slot}`, never by this endpoint. |
 
     `slots.frames[].tool_call` is set when a frame's required slots are all
-    filled. Tools with a `remote` binding really execute on their MCP server
-    (the shipped Zoho CRM lookups and the product tools); the response is `tool_result`,
+    filled. Intents with a `remote` binding really execute on their MCP server
+    (the shipped Zoho CRM lookups and the product intents); the response is `tool_result`,
     and `answer` is that result as a briefing for the agent: `answer_mode`
     picks a `focused` one (just what was asked) or a `full` one (everything
     useful in the result). The turn waits for the call, up to
@@ -840,10 +820,11 @@ def post_transcript(tenant_id: TenantIdPath, call_id: CallIdPath, body: Transcri
 #
 # Reads are the pipeline's live catalog; writes go through catalog.py, which
 # saves to config.CATALOG_PATH and re-embeds exemplars on the next turn.
-# Names are the ID. The rename endpoints move one everywhere at once: the
-# catalog, the intent->tool mapping, and every live call's frames.
-# `label` is the display name; every view that carries an intent or tool name
-# carries its label next to it, so UIs never need to show the raw name.
+# Names are the ID, and an intent's tool calls are named after it. Renaming
+# moves one everywhere at once: the catalog, and every live call's frames and
+# tool calls. `label` is the display name; every view that carries an intent
+# or tool name carries its label next to it, so UIs never need to show the
+# raw name.
 
 
 @contextmanager
@@ -864,23 +845,10 @@ def _intent_info(name: str) -> IntentInfo:
     return IntentInfo(
         name=name,
         label=views.intent_label(name),
+        description=spec.get("description"),
         required_slots=spec["required_slots"],
-        tool=INTENT_TO_TOOL.get(name),
         exemplar_count=len(spec["exemplars"]),
         exemplars=spec["exemplars"],
-    )
-
-
-def _tool_info(name: str) -> ToolInfo:
-    spec = TOOLS.get(name)
-    if spec is None:
-        raise ApiError(404, "tool_not_found", f"No tool named {name!r}.")
-    return ToolInfo(
-        name=name,
-        label=views.tool_label(name),
-        description=spec["description"],
-        input_schema=spec["inputSchema"],
-        intents=[i for i, t in INTENT_TO_TOOL.items() if t == name],
         executes_live=executes_live(name),
         remote=spec.get("remote"),
     )
@@ -888,8 +856,9 @@ def _tool_info(name: str) -> ToolInfo:
 
 @app.get("/v1/intents", response_model=list[IntentInfo], tags=["catalog"])
 def list_intents():
-    """Every intent the pipeline can recognise, its display label, required
-    slots, the tool it fires, and its retrieval exemplars."""
+    """Every intent the pipeline can recognise: its display label, what its
+    tool call does, its required slots, its retrieval exemplars, and whether
+    it really executes (`remote`) or is a mock that only builds the call."""
     return [_intent_info(name) for name in list(INTENTS)]
 
 
@@ -903,8 +872,12 @@ def get_intent(name: str):
     responses={**_INVALID, 409: {"model": ErrorResponse, "description": "Intent already exists."}},
 )
 def create_intent(body: IntentCreate):
-    """Add an intent. It's live from the next turn of every call."""
-    catalog.put_intent(body.name, body.label, body.exemplars, body.required_slots, body.tool, create=True)
+    """Add an intent. It's live from the next turn of every call. Without
+    `remote` it's a mock: it builds a tool call but doesn't execute."""
+    remote = body.remote.model_dump(exclude_none=True) if body.remote else None
+    catalog.put_intent(
+        body.name, body.label, body.description, body.exemplars, body.required_slots, create=True, remote=remote
+    )
     call_log.log_event("intent_created", intent=body.name)
     return _intent_info(body.name)
 
@@ -914,10 +887,17 @@ def create_intent(body: IntentCreate):
     responses={**_CATALOG_NOT_FOUND, **_INVALID},
 )
 def update_intent(name: str, body: IntentUpdate):
-    """Replace an intent's label, exemplars, required slots and tool (send the
-    full intent; an omitted label falls back to the humanized name). Frames already open keep their slots but are checked against the
-    new `required_slots` from their next turn."""
-    catalog.put_intent(name, body.label, body.exemplars, body.required_slots, body.tool, create=False)
+    """Replace an intent's label, description, exemplars and required slots
+    (send the full intent; an omitted label falls back to the humanized name),
+    and its `remote` binding if sent. Frames already open keep their slots but
+    are checked against the new `required_slots` from their next turn."""
+    if "remote" not in body.model_fields_set:
+        remote = catalog.KEEP
+    else:
+        remote = body.remote.model_dump(exclude_none=True) if body.remote else None
+    catalog.put_intent(
+        name, body.label, body.description, body.exemplars, body.required_slots, create=False, remote=remote
+    )
     call_log.log_event("intent_updated", intent=name)
     return _intent_info(name)
 
@@ -927,9 +907,10 @@ def update_intent(name: str, body: IntentUpdate):
     responses={**_CATALOG_NOT_FOUND, **_INVALID, 409: {"model": ErrorResponse, "description": "`new_name` already exists."}},
 )
 def rename_intent(name: str, body: RenameRequest):
-    """Rename an intent in one step. Its label, exemplars, slots and tool
-    mapping move with it, and frames in live calls switch to the new name
-    (a frame waiting on slots keeps waiting). Past log records keep the old name."""
+    """Rename an intent in one step. Its label, exemplars, slots and binding
+    move with it, and frames in live calls switch to the new name, along with
+    tool calls they already built (a frame waiting on slots keeps waiting).
+    Past log records keep the old name."""
     with _all_calls_locked() as sessions:
         catalog.rename_intent(name, body.new_name)
         moved = 0
@@ -938,6 +919,8 @@ def rename_intent(name: str, body: RenameRequest):
                 if frame.intent == name:
                     frame.intent = body.new_name
                     moved += 1
+                if frame.tool_call and frame.tool_call.get("tool") == name:
+                    frame.tool_call = {**frame.tool_call, "tool": body.new_name}
     logger.info("intent %s renamed to %s (%d live frame(s) moved)", name, body.new_name, moved)
     call_log.log_event("intent_renamed", intent=body.new_name, old_name=name, live_frames=moved)
     return _intent_info(body.new_name)
@@ -958,75 +941,6 @@ def delete_intent(name: str):
     call_log.log_event("intent_deleted", intent=name)
 
 
-@app.get("/v1/tools", response_model=list[ToolInfo], tags=["catalog"])
-def list_tools():
-    """The MCP-shaped tool catalog. `executes_live` marks the tools that really
-    run on a remote MCP server (`remote`); all others are mocks that only build
-    the call."""
-    return [_tool_info(name) for name in list(TOOLS)]
-
-
-@app.get("/v1/tools/{name}", response_model=ToolInfo, tags=["catalog"], responses=_CATALOG_NOT_FOUND)
-def get_tool(name: str):
-    return _tool_info(name)
-
-
-@app.post(
-    "/v1/tools", response_model=ToolInfo, status_code=201, tags=["catalog"],
-    responses={**_INVALID, 409: {"model": ErrorResponse, "description": "Tool already exists."}},
-)
-def create_tool(body: ToolCreate):
-    """Add a tool. Without `remote` it's a mock: it builds a call but doesn't
-    execute. Map an intent to it with `PUT /v1/intents/{name}`."""
-    remote = body.remote.model_dump(exclude_none=True) if body.remote else None
-    catalog.put_tool(body.name, body.label, body.description, body.input_schema, create=True, remote=remote)
-    call_log.log_event("tool_created", tool=body.name)
-    return _tool_info(body.name)
-
-
-@app.put("/v1/tools/{name}", response_model=ToolInfo, tags=["catalog"], responses={**_CATALOG_NOT_FOUND, **_INVALID})
-def update_tool(name: str, body: ToolUpdate):
-    """Replace a tool's label, description and input schema (an omitted label
-    falls back to the humanized name), and its `remote` binding if sent.
-    Refused if an intent mapped to it doesn't collect every argument the new
-    schema requires."""
-    if "remote" not in body.model_fields_set:
-        remote = catalog.KEEP
-    else:
-        remote = body.remote.model_dump(exclude_none=True) if body.remote else None
-    catalog.put_tool(name, body.label, body.description, body.input_schema, create=False, remote=remote)
-    call_log.log_event("tool_updated", tool=name)
-    return _tool_info(name)
-
-
-@app.post(
-    "/v1/tools/{name}/rename", response_model=ToolInfo, tags=["catalog"],
-    responses={**_CATALOG_NOT_FOUND, **_INVALID, 409: {"model": ErrorResponse, "description": "`new_name` already exists."}},
-)
-def rename_tool(name: str, body: RenameRequest):
-    """Rename a tool in one step. Every intent mapped to it is repointed, a
-    live tool keeps executing, and tool calls already built in live calls
-    switch to the new name. Past log records keep the old name."""
-    with _all_calls_locked() as sessions:
-        catalog.rename_tool(name, body.new_name)
-        moved = 0
-        for _, session in sessions:
-            for frame in session.store.frames:
-                if frame.tool_call and frame.tool_call.get("tool") == name:
-                    frame.tool_call = {**frame.tool_call, "tool": body.new_name}
-                    moved += 1
-    logger.info("tool %s renamed to %s (%d live tool call(s) moved)", name, body.new_name, moved)
-    call_log.log_event("tool_renamed", tool=body.new_name, old_name=name, live_calls=moved)
-    return _tool_info(body.new_name)
-
-
-@app.delete("/v1/tools/{name}", status_code=204, tags=["catalog"], responses={**_CATALOG_NOT_FOUND, **_CONFLICT})
-def delete_tool(name: str):
-    """Remove a tool. Refused while any intent still maps to it."""
-    catalog.delete_tool(name)
-    call_log.log_event("tool_deleted", tool=name)
-
-
 @app.get("/v1/slots", response_model=list[str], tags=["catalog"])
 def list_slots():
     """Slot names an intent's `required_slots` can use. Each has a built-in
@@ -1038,7 +952,7 @@ def list_slots():
 
 
 class RemoteToolInfo(BaseModel):
-    name: str = Field(..., description="Use as `remote.tool` on a catalog tool.")
+    name: str = Field(..., description="Use as `remote.tool` on an intent.")
     description: str
     input_schema: dict
     annotations: dict = Field(..., description="The server's hints, e.g. `readOnlyHint`, `destructiveHint`.")
@@ -1062,8 +976,8 @@ def list_connections():
     },
 )
 def list_connection_tools(name: str):
-    """The tools the connection's MCP server offers. Use these to fill a
-    catalog tool's `remote` binding."""
+    """The tools the connection's MCP server offers. Use these to fill an
+    intent's `remote` binding."""
     try:
         return mcp_client.list_tools(name)
     except mcp_client.ConnectionNotConfigured as exc:

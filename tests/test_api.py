@@ -20,6 +20,7 @@ from ciap.pipeline import intents
 from ciap.pipeline import responder
 from ciap.integrations import mcp_client
 from ciap.integrations import mcp_tools
+from ciap.integrations import zoho
 from ciap.pipeline import state_store
 
 # Stands in for Zoho's hosted MCP server behind the "zoho" connection,
@@ -111,10 +112,8 @@ def client(monkeypatch, tmp_path, request):
     fake_zoho_state.update(down=False, unauthorised=False, searches=[])
     request.addfinalizer(mcp_client.shutdown)
     # Catalog edits mutate these shared dicts in place: restore them after.
-    for mod, attr in [(intents, "INTENTS"), (mcp_tools, "TOOLS"), (mcp_tools, "INTENT_TO_TOOL")]:
-        original = getattr(mod, attr)
-        snapshot = dict(original)
-        request.addfinalizer(lambda o=original, s=snapshot: (o.clear(), o.update(s)))
+    snapshot = dict(intents.INTENTS)
+    request.addfinalizer(lambda: (intents.INTENTS.clear(), intents.INTENTS.update(snapshot)))
     monkeypatch.setattr(config, "CATALOG_PATH", str(tmp_path / "catalog.json"))
     server._calls.clear()
     server._expired_ids.clear()
@@ -173,6 +172,13 @@ def assert_error(r, status, code):
     assert r.status_code == status, r.text
     body = r.json()["error"]
     assert body["code"] == code and body["message"]
+
+
+def rebind(client, intent, remote):
+    """PUT an intent back unchanged except for its remote binding."""
+    spec = client.get(f"/v1/intents/{intent}").json()
+    body = {k: spec[k] for k in ("label", "description", "exemplars", "required_slots")}
+    return client.put(f"/v1/intents/{intent}", json={**body, "remote": remote})
 
 
 # -- lifecycle ----------------------------------------------------------------
@@ -359,7 +365,7 @@ def test_turn_stable_view_and_slot_fill_fires_tool(client):
     assert v2["intent"]["turn_type"] == "slot_fill"
     assert v2["slots"]["frames"][0]["filled_this_turn"] == ["order_id"]
     assert v2["mcp"]["fired_this_turn"] == [
-        {"tool": "get_order_status", "tool_label": "Get Order Status", "arguments": {"order_id": "ORD-99213"}}
+        {"tool": "track_order", "tool_label": "Track Order", "arguments": {"order_id": "ORD-99213"}}
     ]
     assert v2["slots"]["frames"][0]["status"] == "FIRED"
 
@@ -403,7 +409,7 @@ def test_zoho_tool_result_exposed(client):
     cid = new_call(client)
     v = turn(client, cid, "look me up at jane@example.com").json()
     frame = v["slots"]["frames"][0]
-    assert frame["tool_call"]["tool"] == "search_zoho_lead"
+    assert frame["tool_call"]["tool"] == "lookup_crm_record"
     assert frame["tool_result"] == {"status": "success", "data": {"data": [{"Email": "jane@example.com"}]}, "message": None}
     assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["tool_result"] == frame["tool_result"]
 
@@ -425,7 +431,7 @@ def test_zoho_answer_falls_back_on_invented_value(client):
     cid = new_call(client)
     answer = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]["answer"]
     assert answer["source"] == "fallback" and "98765" in answer["note"]
-    assert answer["text"] == "Zoho CRM Customer Lookup found 1 result: email jane@example.com."
+    assert answer["text"] == "CRM Record Lookup found 1 result: email jane@example.com."
 
 
 def test_zoho_answer_falls_back_when_model_fails(client, monkeypatch):
@@ -450,7 +456,7 @@ def test_answer_question_spans_slot_fill_turns(client):
 def test_answer_rules_for_no_results_and_error(client):
     cid = new_call(client)
     answer = turn(client, cid, "look me up at nobody@example.com").json()["slots"]["frames"][0]["answer"]
-    assert answer == {"text": "Zoho CRM Customer Lookup: nothing found for email nobody@example.com.",
+    assert answer == {"text": "CRM Record Lookup: nothing found for email nobody@example.com.",
                       "source": "rule", "model": None, "note": None, "mode": "focused"}
     fake_zoho_state["down"] = True
     cid = new_call(client)
@@ -526,13 +532,11 @@ def test_lookup_with_no_match_anywhere_is_no_results(client):
 
 
 def test_tool_fallback_binding_validated(client):
-    spec = client.get("/v1/tools/search_zoho_lead").json()
-    body = {"description": spec["description"], "input_schema": spec["input_schema"]}
     bad = {"connection": "zoho", "tool": "ZohoCRM_searchRecords",
            "fallback": {"connection": "zoho", "tool": "ZohoCRM_searchRecords", "arguments": {"q": "{phone}"}}}
-    assert_error(client.put("/v1/tools/search_zoho_lead", json={**body, "remote": bad}), 422, "invalid_remote")
+    assert_error(rebind(client, "lookup_crm_record", bad), 422, "invalid_remote")
     good = {**bad, "fallback": {"connection": "zoho", "tool": "ZohoCRM_searchRecords", "arguments": {"q": "{email}"}}}
-    r = client.put("/v1/tools/search_zoho_lead", json={**body, "remote": good})
+    r = rebind(client, "lookup_crm_record", good)
     assert r.status_code == 200 and r.json()["remote"]["fallback"]["arguments"] == {"q": "{email}"}
 
 
@@ -561,11 +565,11 @@ def test_responder_prune_and_fallback_render():
     ], "info": {"count": 2}}
     pruned = responder.prune(data)
     assert pruned["data"][0] == {"id": "1", "First_Name": "Jane", "Owner": {"name": "Priya"}, "leadStatus": "Contacted"}
-    assert responder.render_fallback("search_zoho_lead", pruned) == (
-        "Zoho CRM Customer Lookup found 2 results: (1) first name Jane, owner name Priya, lead status Contacted. "
+    assert responder.render_fallback("lookup_crm_record", pruned) == (
+        "CRM Record Lookup found 2 results: (1) first name Jane, owner name Priya, lead status Contacted. "
         "(2) first name John."
     )
-    assert responder.render_fallback("search_zoho_lead", {"text": "No such lead."}) == "Zoho CRM Customer Lookup: No such lead."
+    assert responder.render_fallback("lookup_crm_record", {"text": "No such lead."}) == "CRM Record Lookup: No such lead."
 
 
 def test_responder_full_mode_limits():
@@ -573,10 +577,10 @@ def test_responder_full_mode_limits():
     focused, full = responder.prune(data), responder.prune(data, "full")
     assert len(focused["data"]) == 5 and len(focused["data"][0]["Notes"]) == 303
     assert len(full["data"]) == 8 and full["data"][0]["Notes"] == "x" * 500
-    assert "Showing the first 3." in responder.render_fallback("search_zoho_lead", full)
-    assert "Showing the first" not in responder.render_fallback("search_zoho_lead", full, "full")
+    assert "Showing the first 3." in responder.render_fallback("lookup_crm_record", full)
+    assert "Showing the first" not in responder.render_fallback("lookup_crm_record", full, "full")
     frame = state_store.Frame(id=1, intent="lookup_crm_record", status="FIRED",
-                              tool_call={"tool": "search_zoho_lead", "arguments": {}})
+                              tool_call={"tool": "lookup_crm_record", "arguments": {}})
     assert "holds 8 records" in responder._prompt(frame, full, "full")
     assert "records" not in responder._prompt(frame, full, "focused").split("Rules:")[0]
 
@@ -647,10 +651,10 @@ def test_responder_finds_records_nested_deep_and_keeps_tag_order():
 def test_responder_fallback_counts_the_whole_result():
     data = {"data": [{"Email": f"lead{i}@example.com"} for i in range(8)]}
     ranked = responder.prune(data, "focused", responder.Relevance("find me", {"email": "lead7@example.com"}))
-    rendered = responder.render_fallback("search_zoho_lead", ranked)
-    assert rendered.startswith("Zoho CRM Customer Lookup found 8 results: (1) email lead7@example.com.")
+    rendered = responder.render_fallback("lookup_crm_record", ranked)
+    assert rendered.startswith("CRM Record Lookup found 8 results: (1) email lead7@example.com.")
     assert rendered.endswith("Showing the 3 most relevant.")
-    assert responder.render_fallback("search_zoho_lead", responder.prune(data)).endswith("Showing the first 3.")
+    assert responder.render_fallback("lookup_crm_record", responder.prune(data)).endswith("Showing the first 3.")
 
 
 def test_responder_relevance_edge_cases():
@@ -673,7 +677,7 @@ def test_responder_prompt_sees_match_past_list_limit(monkeypatch):
     prompts = []
     monkeypatch.setattr(responder, "_ask_model", lambda prompt, mode="focused": prompts.append(prompt) or "ok")
     frame = state_store.Frame(id=1, intent="lookup_crm_record", status="FIRED",
-                              tool_call={"tool": "search_zoho_lead", "arguments": {"email": "lead7@example.com"}})
+                              tool_call={"tool": "lookup_crm_record", "arguments": {"email": "lead7@example.com"}})
     frame.tool_result = {"status": "success", "message": None,
                          "data": {"data": [{"Email": f"lead{i}@example.com"} for i in range(8)]}}
     assert responder.compose_answer(frame)["source"] == "llm"
@@ -682,7 +686,7 @@ def test_responder_prompt_sees_match_past_list_limit(monkeypatch):
 
 def _raw_frame(data):
     frame = state_store.Frame(id=1, intent="lookup_crm_record", status="FIRED",
-                              tool_call={"tool": "search_zoho_lead", "arguments": {"email": "lead7@example.com"}},
+                              tool_call={"tool": "lookup_crm_record", "arguments": {"email": "lead7@example.com"}},
                               utterances=[{"speaker": "customer", "text": "look me up"}])
     frame.tool_result = {"status": "success", "message": None, "data": data}
     return frame
@@ -712,7 +716,7 @@ def test_responder_unpruned_result_too_big_for_context(monkeypatch):
                      for i in range(12)]}
     answer = responder.compose_answer(_raw_frame(data))
     assert answer["source"] == "fallback" and "too large for the model's context" in answer["note"]
-    assert answer["text"].startswith("Zoho CRM Customer Lookup found 12 results:") and "approval" not in answer["text"]
+    assert answer["text"].startswith("CRM Record Lookup found 12 results:") and "approval" not in answer["text"]
 
 
 def test_responder_pruned_by_default_with_ollama_context(monkeypatch):
@@ -743,11 +747,7 @@ def test_zoho_no_match_is_no_results(client):
 
 
 def test_tool_returning_nothing_is_no_results(client):
-    spec = client.get("/v1/tools/search_zoho_lead").json()
-    client.put("/v1/tools/search_zoho_lead", json={
-        "description": spec["description"], "input_schema": spec["input_schema"],
-        "remote": {"connection": "zoho", "tool": "empty_tool"},
-    })
+    rebind(client, "lookup_crm_record", {"connection": "zoho", "tool": "empty_tool"})
     cid = new_call(client)
     frame = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]
     assert frame["tool_result"]["status"] == "no_results"
@@ -824,7 +824,7 @@ def test_override_refires_tool_with_corrected_value(client, slot_override):
     assert v["intent"]["turn_type"] == "slot_override" and v["speaker"] == "agent"
     assert v["turn_index"] == 3
     assert v["mcp"]["fired_this_turn"] == [
-        {"tool": "get_order_status", "tool_label": "Get Order Status", "arguments": {"order_id": "ORD-22222"}}
+        {"tool": "track_order", "tool_label": "Track Order", "arguments": {"order_id": "ORD-22222"}}
     ]
     assert v["slots"]["frames"][0]["slots"]["order_id"] == "ORD-22222"
 
@@ -886,25 +886,23 @@ def test_transcript_validation_processes_nothing(client, payload):
 
 # -- catalog, log, health, demo -------------------------------------------------
 
-def test_intent_and_tool_catalogs(client):
+def test_intent_catalog(client):
     intents = {i["name"]: i for i in client.get("/v1/intents").json()}
-    assert intents["track_order"]["required_slots"] == ["order_id"]
-    assert intents["track_order"]["tool"] == "get_order_status"
-    tools = {t["name"]: t for t in client.get("/v1/tools").json()}
-    assert tools["search_zoho_lead"]["executes_live"] is True
-    assert tools["get_order_status"]["executes_live"] is False
-    assert tools["get_order_status"]["intents"] == ["track_order"]
-    assert tools["get_order_status"]["input_schema"]["required"] == ["order_id"]
-    assert all(i["tool"] in tools for i in intents.values() if i["tool"])
+    track = intents["track_order"]
+    assert track["required_slots"] == ["order_id"]
+    assert track["description"] == "Look up the shipping/tracking status of a customer's order."
+    assert track["executes_live"] is False and track["remote"] is None
+    lookup = intents["lookup_crm_record"]
+    assert lookup["executes_live"] is True and lookup["remote"] == zoho.LEAD_SEARCH
+    # Every shipped binding only fills in slots its intent collects.
+    for i in intents.values():
+        assert mcp_tools.placeholders(i["remote"]) <= set(i["required_slots"]), i["name"]
 
 
 # -- catalog edits ------------------------------------------------------------
 
-NEW_INTENT = {"name": "gift_wrap", "exemplars": ["Can you gift wrap it"], "required_slots": ["order_id"],
-              "tool": "get_order_status"}
-NEW_TOOL = {"name": "add_gift_wrap", "description": "Add gift wrap to an order.",
-            "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}},
-                             "required": ["order_id"]}}
+NEW_INTENT = {"name": "gift_wrap", "description": "Add gift wrap to an order.",
+              "exemplars": ["Can you gift wrap it"], "required_slots": ["order_id"]}
 
 
 def test_intent_crud_persists_and_reloads(client):
@@ -912,16 +910,16 @@ def test_intent_crud_persists_and_reloads(client):
 
     r = client.post("/v1/intents", json=NEW_INTENT)
     assert r.status_code == 201, r.text
-    assert r.json()["tool"] == "get_order_status" and r.json()["exemplar_count"] == 1
+    assert r.json()["description"] == "Add gift wrap to an order." and r.json()["exemplar_count"] == 1
+    assert r.json()["executes_live"] is False
     assert client.get("/v1/intents/gift_wrap").json()["exemplars"] == ["Can you gift wrap it"]
-    assert "gift_wrap" in client.get("/v1/tools/get_order_status").json()["intents"]
 
-    r = client.put("/v1/intents/gift_wrap", json={"exemplars": ["Wrap it please", "Gift wrap"], "tool": None})
-    assert r.json()["tool"] is None and r.json()["required_slots"] == []
+    r = client.put("/v1/intents/gift_wrap", json={"exemplars": ["Wrap it please", "Gift wrap"]})
+    assert r.json()["description"] is None and r.json()["required_slots"] == []
 
     saved = json.loads(Path(config.CATALOG_PATH).read_text(encoding="utf-8"))
-    assert saved["intents"]["gift_wrap"] == {"exemplars": ["Wrap it please", "Gift wrap"],
-                                             "required_slots": [], "tool": None}
+    assert list(saved) == ["intents"]
+    assert saved["intents"]["gift_wrap"] == {"exemplars": ["Wrap it please", "Gift wrap"], "required_slots": []}
 
     assert client.delete("/v1/intents/gift_wrap").status_code == 204
     assert_error(client.get("/v1/intents/gift_wrap"), 404, "intent_not_found")
@@ -930,17 +928,56 @@ def test_intent_crud_persists_and_reloads(client):
     intents.INTENTS["stale"] = {"exemplars": ["x"], "required_slots": []}
     assert catalog.load()
     assert "stale" not in intents.INTENTS and "gift_wrap" not in intents.INTENTS
-    assert mcp_tools.INTENT_TO_TOOL["track_order"] == "get_order_status"
+    assert intents.INTENTS["lookup_crm_record"]["remote"] == zoho.LEAD_SEARCH
+
+
+def test_new_intent_fires_a_call_named_after_it(client, monkeypatch):
+    client.post("/v1/intents", json={**NEW_INTENT, "label": "Gift Wrap Order"})
+    monkeypatch.setattr(state_store, "retrieve", lambda text, top_k=3: [("gift_wrap", 0.9)])
+    v = turn(client, new_call(client), "gift wrap ORD-5555").json()
+    assert v["mcp"]["fired_this_turn"] == [
+        {"tool": "gift_wrap", "tool_label": "Gift Wrap Order", "arguments": {"order_id": "ORD-5555"}}
+    ]
+    assert v["slots"]["frames"][0]["tool_result"] is None  # no binding: a mock
+
+
+def test_catalog_saved_with_separate_tools_is_merged(client):
+    from ciap import catalog
+
+    def save_old(tools, intent_tools):
+        # Before intents carried their own tool: a "tools" map, and each
+        # intent naming the tool it fired.
+        old = {n: {"exemplars": spec["exemplars"], "required_slots": spec["required_slots"], "tool": intent_tools.get(n)}
+               for n, spec in intents.INTENTS.items()}
+        Path(config.CATALOG_PATH).write_text(json.dumps({"intents": old, "tools": tools}), encoding="utf-8")
+
+    binding = {"connection": "zoho", "tool": "ZohoCRM_searchRecords", "arguments": {"q": "{order_id}"}}
+    save_old({"get_order_status": {"description": "Order status.", "remote": binding}}, {"track_order": "get_order_status"})
+    assert catalog.load()
+    info = client.get("/v1/intents/track_order").json()
+    assert info["description"] == "Order status." and info["remote"] == binding
+    assert client.get("/v1/intents/cancel_order").json()["description"] is None
+
+    # Older still, the Zoho lookup was live by its tool's name alone ...
+    save_old({"search_zoho_lead": {"description": "Find a lead."}}, {"lookup_crm_record": "search_zoho_lead"})
+    assert catalog.load()
+    assert client.get("/v1/intents/lookup_crm_record").json()["remote"] == zoho.LEAD_SEARCH
+
+    # ... or by a "backend", under any name.
+    save_old({"crm_lookup": {"description": "Find a lead.", "backend": "zoho_lead_search"}},
+             {"lookup_crm_record": "crm_lookup"})
+    assert catalog.load()
+    assert client.get("/v1/intents/lookup_crm_record").json()["executes_live"] is True
+    assert "backend" not in intents.INTENTS["lookup_crm_record"]
 
 
 # -- labels -------------------------------------------------------------------
 
-def test_every_catalog_entry_ships_with_a_label(client):
-    for path in ("/v1/intents", "/v1/tools"):
-        for item in client.get(path).json():
-            assert item["label"] and item["label"] != item["name"], item["name"]
+def test_every_catalog_entry_ships_with_a_label_and_description(client):
+    for item in client.get("/v1/intents").json():
+        assert item["label"] and item["label"] != item["name"], item["name"]
+        assert item["description"], item["name"]
     assert client.get("/v1/intents/track_order").json()["label"] == "Track Order"
-    assert client.get("/v1/tools/search_zoho_lead").json()["label"] == "Zoho CRM Customer Lookup"
 
 
 def test_labels_on_turn_frame_and_call_views(client):
@@ -950,9 +987,9 @@ def test_labels_on_turn_frame_and_call_views(client):
     assert v["intent"]["candidates"][0] == {"intent": "track_order", "label": "Track Order", "score": 0.8}
     frame = v["slots"]["frames"][0]
     assert frame["intent_label"] == "Track Order"
-    assert frame["tool_call"]["tool_label"] == "Get Order Status"
+    assert frame["tool_call"]["tool_label"] == "Track Order"
     assert v["mcp"]["all_calls"][0]["intent_label"] == "Track Order"
-    assert v["mcp"]["all_calls"][0]["tool_label"] == "Get Order Status"
+    assert v["mcp"]["all_calls"][0]["tool_label"] == "Track Order"
 
     state = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()
     assert state["frames"][0]["intent_label"] == "Track Order"
@@ -969,12 +1006,9 @@ def test_label_create_update_persist_and_fallback(client):
 
     r = client.post("/v1/intents", json={**NEW_INTENT, "label": "  Gift Wrapping  "})
     assert r.status_code == 201 and r.json()["label"] == "Gift Wrapping"
-    r = client.post("/v1/tools", json={**NEW_TOOL, "label": "Add Gift Wrap Now"})
-    assert r.json()["label"] == "Add Gift Wrap Now"
 
     saved = json.loads(Path(config.CATALOG_PATH).read_text(encoding="utf-8"))
     assert saved["intents"]["gift_wrap"]["label"] == "Gift Wrapping"
-    assert saved["tools"]["add_gift_wrap"]["label"] == "Add Gift Wrap Now"
     assert catalog.load()
     assert client.get("/v1/intents/gift_wrap").json()["label"] == "Gift Wrapping"
 
@@ -987,22 +1021,22 @@ def test_label_create_update_persist_and_fallback(client):
 @pytest.mark.parametrize("label", ["", "   ", "x" * 81])
 def test_label_validation(client, label):
     assert_error(client.post("/v1/intents", json={**NEW_INTENT, "label": label}), 422, "validation_error")
-    assert_error(client.post("/v1/tools", json={**NEW_TOOL, "label": label}), 422, "validation_error")
 
 
 def test_label_edit_shows_on_live_call(client):
     cid = new_call(client)
     turn(client, cid, "track my order ORD-12345")
     spec = client.get("/v1/intents/track_order").json()
-    body = {"label": "Order Tracking", "exemplars": spec["exemplars"],
-            "required_slots": spec["required_slots"], "tool": spec["tool"]}
+    body = {"label": "Order Tracking", "description": spec["description"], "exemplars": spec["exemplars"],
+            "required_slots": spec["required_slots"]}
     assert client.put("/v1/intents/track_order", json=body).status_code == 200
-    assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["intent_label"] == "Order Tracking"
+    frame = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]
+    assert frame["intent_label"] == "Order Tracking" and frame["tool_call"]["tool_label"] == "Order Tracking"
 
 
 # -- renames ------------------------------------------------------------------
 
-def test_intent_rename_moves_spec_mapping_and_live_frames(client, monkeypatch):
+def test_intent_rename_moves_spec_and_live_frames(client, monkeypatch):
     from ciap import catalog
     from ciap.pipeline import embeddings
 
@@ -1016,86 +1050,49 @@ def test_intent_rename_moves_spec_mapping_and_live_frames(client, monkeypatch):
     assert r.json() == {**original, "name": "order_tracking"}
     assert embeddings._index is None
     assert_error(client.get("/v1/intents/track_order"), 404, "intent_not_found")
-    assert client.get("/v1/tools/get_order_status").json()["intents"] == ["order_tracking"]
 
-    # The waiting frame carries on under the new name and still fires.
+    # The waiting frame carries on under the new name and fires a call named after it.
     frame = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]
     assert frame["intent"] == "order_tracking" and frame["status"] == "AWAITING_INFO"
     monkeypatch.setattr(state_store, "retrieve", lambda text, top_k=3: [("order_tracking", 0.1)])
     v = turn(client, cid, "ORD-12345").json()
     assert v["intent"]["turn_type"] == "slot_fill" and v["intent"]["selected_intent"] == "order_tracking"
     assert v["mcp"]["all_calls"][0]["intent"] == "order_tracking"
+    assert v["mcp"]["fired_this_turn"][0]["tool"] == "order_tracking"
 
     saved = json.loads(Path(config.CATALOG_PATH).read_text(encoding="utf-8"))
-    assert "track_order" not in saved["intents"] and saved["intents"]["order_tracking"]["tool"] == "get_order_status"
+    assert "track_order" not in saved["intents"]
+    assert saved["intents"]["order_tracking"]["description"] == original["description"]
     assert catalog.load() and "order_tracking" in intents.INTENTS
 
 
-def test_tool_rename_repoints_intents_and_live_calls(client):
+def test_intent_rename_moves_tool_calls_already_built(client):
     cid = new_call(client)
-    turn(client, cid, "track my order ORD-12345")  # fires get_order_status
-
-    r = client.post("/v1/tools/get_order_status/rename", json={"new_name": "get_status_order"})
-    assert r.status_code == 200, r.text
-    assert r.json()["name"] == "get_status_order" and r.json()["intents"] == ["track_order"]
-    assert r.json()["label"] == "Get Order Status"
-    assert client.get("/v1/intents/track_order").json()["tool"] == "get_status_order"
-    assert_error(client.get("/v1/tools/get_order_status"), 404, "tool_not_found")
-
+    turn(client, cid, "track my order ORD-12345")  # fires track_order
+    assert client.post("/v1/intents/track_order/rename", json={"new_name": "order_tracking"}).status_code == 200
     frame = client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]
-    assert frame["tool_call"]["tool"] == "get_status_order"
-
-    cid2 = new_call(client)
-    v = turn(client, cid2, "track my order ORD-777777").json()
-    assert v["mcp"]["fired_this_turn"][0]["tool"] == "get_status_order"
+    assert frame["tool_call"] == {"tool": "order_tracking", "tool_label": "Track Order", "arguments": {"order_id": "ORD-12345"}}
 
 
-def test_renamed_live_tool_still_executes(client):
-    r = client.post("/v1/tools/search_zoho_lead/rename", json={"new_name": "crm_lead_search"})
-    assert r.json()["executes_live"] is True
-    # A PUT that leaves out `remote` keeps it live too.
-    spec = r.json()
-    r = client.put("/v1/tools/crm_lead_search", json={"description": "Find a CRM lead.", "input_schema": spec["input_schema"]})
+def test_renamed_live_intent_still_executes(client, monkeypatch):
+    r = client.post("/v1/intents/lookup_crm_record/rename", json={"new_name": "crm_lead_search"})
     assert r.json()["executes_live"] is True
 
-    cid = new_call(client)
-    v = turn(client, cid, "look me up, jane@example.com").json()
-    frame = v["slots"]["frames"][0]
+    monkeypatch.setattr(state_store, "retrieve", lambda text, top_k=3: [("crm_lead_search", 0.8)])
+    frame = turn(client, new_call(client), "look me up, jane@example.com").json()["slots"]["frames"][0]
     assert frame["tool_call"]["tool"] == "crm_lead_search"
     assert frame["tool_result"] == {"status": "success", "data": {"data": [{"Email": "jane@example.com"}]}, "message": None}
-
-
-def test_old_saved_catalog_keeps_zoho_live(client):
-    from ciap import catalog
-
-    # Saved before tools had a "backend" (live by name) ...
-    tools = {n: {k: v for k, v in spec.items() if k != "remote"} for n, spec in mcp_tools.TOOLS.items()}
-    Path(config.CATALOG_PATH).write_text(json.dumps({"intents": {}, "tools": tools}), encoding="utf-8")
-    assert catalog.load()
-    assert client.get("/v1/tools/search_zoho_lead").json()["remote"] == mcp_tools.ZOHO_LEAD_SEARCH_REMOTE
-
-    # ... and with one, under a renamed tool.
-    tools = {("crm_lookup" if n == "search_zoho_lead" else n): {k: v for k, v in spec.items() if k != "remote"}
-             for n, spec in mcp_tools.TOOLS.items()}
-    tools["crm_lookup"]["backend"] = "zoho_lead_search"
-    Path(config.CATALOG_PATH).write_text(json.dumps({"intents": {}, "tools": tools}), encoding="utf-8")
-    assert catalog.load()
-    info = client.get("/v1/tools/crm_lookup").json()
-    assert info["executes_live"] is True and info["remote"]["connection"] == "zoho"
-    assert "backend" not in mcp_tools.TOOLS["crm_lookup"]
 
 
 @pytest.mark.parametrize("path,body,status,code", [
     ("/v1/intents/nope/rename", {"new_name": "x_new"}, 404, "intent_not_found"),
     ("/v1/intents/track_order/rename", {"new_name": "cancel_order"}, 409, "intent_exists"),
     ("/v1/intents/track_order/rename", {"new_name": "Bad Name"}, 422, "validation_error"),
-    ("/v1/tools/nope/rename", {"new_name": "x_new"}, 404, "tool_not_found"),
-    ("/v1/tools/get_order_status/rename", {"new_name": "cancel_order"}, 409, "tool_exists"),
-    ("/v1/tools/get_order_status/rename", {}, 422, "validation_error"),
+    ("/v1/intents/track_order/rename", {}, 422, "validation_error"),
 ])
 def test_rename_errors(client, path, body, status, code):
     assert_error(client.post(path, json=body), status, code)
-    assert "track_order" in intents.INTENTS and "get_order_status" in mcp_tools.TOOLS
+    assert "track_order" in intents.INTENTS
 
 
 def test_intent_edit_rebuilds_embedding_index(client, monkeypatch):
@@ -1110,9 +1107,8 @@ def test_intent_edit_rebuilds_embedding_index(client, monkeypatch):
     ({**NEW_INTENT, "name": "track_order"}, "intent_exists"),
     ({**NEW_INTENT, "name": "Bad Name"}, "validation_error"),
     ({**NEW_INTENT, "exemplars": []}, "validation_error"),
+    ({**NEW_INTENT, "description": "  "}, "validation_error"),
     ({**NEW_INTENT, "required_slots": ["shoe_size"]}, "unknown_slot"),
-    ({**NEW_INTENT, "tool": "nope"}, "tool_not_found"),
-    ({**NEW_INTENT, "required_slots": []}, "tool_slot_mismatch"),
 ])
 def test_intent_create_validation(client, body, code):
     r = client.post("/v1/intents", json=body)
@@ -1133,41 +1129,6 @@ def test_intent_delete_refused_while_frame_waiting(client):
     turn(client, cid, "ORD-12345")  # frame fires -> no longer waiting
     assert client.delete("/v1/intents/track_order").status_code == 204
     assert client.get(f"/v1/tenants/{TENANT}/calls/{cid}").json()["frames"][0]["required"] == []
-
-
-def test_tool_crud_and_mapping(client, monkeypatch):
-    r = client.post("/v1/tools", json=NEW_TOOL)
-    assert r.status_code == 201 and r.json()["executes_live"] is False and r.json()["intents"] == []
-    client.post("/v1/intents", json={**NEW_INTENT, "tool": "add_gift_wrap"})
-
-    cid = new_call(client)
-    monkeypatch.setattr(state_store, "retrieve", lambda text, top_k=3: [("gift_wrap", 0.9)])
-    v = turn(client, cid, "gift wrap ORD-5555").json()
-    assert v["mcp"]["fired_this_turn"] == [
-        {"tool": "add_gift_wrap", "tool_label": "Add Gift Wrap", "arguments": {"order_id": "ORD-5555"}}
-    ]
-
-    r = client.put("/v1/tools/add_gift_wrap", json={**NEW_TOOL, "description": "Wrap it."})
-    assert r.json()["description"] == "Wrap it." and r.json()["intents"] == ["gift_wrap"]
-    assert_error(client.delete("/v1/tools/add_gift_wrap"), 409, "tool_in_use")
-
-    client.put("/v1/intents/gift_wrap", json={"exemplars": ["Wrap it"], "tool": None})
-    assert client.delete("/v1/tools/add_gift_wrap").status_code == 204
-    assert_error(client.get("/v1/tools/add_gift_wrap"), 404, "tool_not_found")
-
-
-def test_tool_validation(client):
-    assert_error(client.post("/v1/tools", json={**NEW_TOOL, "name": "cancel_order"}), 409, "tool_exists")
-    bad = {**NEW_TOOL, "input_schema": {"type": "object", "properties": {}, "required": ["order_id"]}}
-    assert_error(client.post("/v1/tools", json=bad), 422, "invalid_input_schema")
-    assert_error(client.post("/v1/tools", json={**NEW_TOOL, "input_schema": {"type": "string"}}),
-                 422, "invalid_input_schema")
-    # track_order doesn't collect `email`, so get_order_status can't start requiring it.
-    schema = {"type": "object", "properties": {"email": {"type": "string"}}, "required": ["email"]}
-    r = client.put("/v1/tools/get_order_status", json={"description": "x", "input_schema": schema})
-    assert_error(r, 422, "tool_slot_mismatch")
-    assert_error(client.put("/v1/tools/nope", json={"description": "x", "input_schema": schema}),
-                 404, "tool_not_found")
 
 
 def test_slots_catalog(client):
@@ -1244,19 +1205,16 @@ def test_openapi_documents_all_v1_routes(client):
     assert "/v1/calls" not in paths
     for p in ["/v1/tenants/{tenant_id}/calls/{call_id}", "/v1/tenants/{tenant_id}/calls/{call_id}/turns", "/v1/tenants/{tenant_id}/calls/{call_id}/transcript",
               "/v1/tenants/{tenant_id}/calls/{call_id}/reset", "/v1/tenants/{tenant_id}/calls/{call_id}/frames/{frame_id}/slots/{slot_name}",
-              "/v1/intents", "/v1/intents/{name}", "/v1/tools", "/v1/tools/{name}", "/v1/slots",
+              "/v1/intents", "/v1/intents/{name}", "/v1/slots",
               "/v1/log", "/health"]:
         assert p in paths, p
+    assert not any(p.startswith("/v1/tools") for p in paths)
 
 
 # -- MCP connections and remote bindings ------------------------------------------
 
 def test_unconfigured_connection_is_a_tool_error(client):
-    spec = client.get("/v1/tools/search_zoho_lead").json()
-    r = client.put("/v1/tools/search_zoho_lead", json={
-        "description": spec["description"], "input_schema": spec["input_schema"],
-        "remote": {"connection": "salesforce", "tool": "ZohoCRM_searchRecords"},
-    })
+    r = rebind(client, "lookup_crm_record", {"connection": "salesforce", "tool": "ZohoCRM_searchRecords"})
     assert r.status_code == 200, r.text
     cid = new_call(client)
     frame = turn(client, cid, "look me up at jane@example.com").json()["slots"]["frames"][0]
@@ -1265,32 +1223,34 @@ def test_unconfigured_connection_is_a_tool_error(client):
 
 
 def test_remote_binding_can_be_set_and_removed(client):
-    body = {**NEW_TOOL, "remote": {"connection": "zoho", "tool": "ZohoCRM_searchRecords",
-                                   "arguments": {"path_variables": {"module": "Orders"},
-                                                 "query_params": {"criteria": "(Order_ID:equals:{order_id})"}}}}
-    r = client.post("/v1/tools", json=body)
+    body = {**NEW_INTENT, "remote": {"connection": "zoho", "tool": "ZohoCRM_searchRecords",
+                                     "arguments": {"path_variables": {"module": "Orders"},
+                                                   "query_params": {"criteria": "(Order_ID:equals:{order_id})"}}}}
+    r = client.post("/v1/intents", json=body)
     assert r.status_code == 201, r.text
     assert r.json()["executes_live"] is True and r.json()["remote"]["tool"] == "ZohoCRM_searchRecords"
 
-    r = client.put("/v1/tools/add_gift_wrap", json={**{k: NEW_TOOL[k] for k in ("description", "input_schema")},
-                                                    "remote": None})
+    update = {k: v for k, v in NEW_INTENT.items() if k != "name"}
+    r = client.put("/v1/intents/gift_wrap", json=update)  # leaving `remote` out keeps it
+    assert r.json()["executes_live"] is True
+    r = client.put("/v1/intents/gift_wrap", json={**update, "remote": None})
     assert r.json()["executes_live"] is False and r.json()["remote"] is None
 
 
 @pytest.mark.parametrize("remote", [
     {"connection": "zoho", "tool": "ZohoCRM_searchRecords",
-     "arguments": {"query_params": {"email": "{email}"}}},  # not an argument of this tool
+     "arguments": {"query_params": {"email": "{email}"}}},  # a slot this intent doesn't collect
     {"connection": "Bad Name", "tool": "ZohoCRM_searchRecords"},
     {"connection": "zoho", "tool": " "},
 ])
 def test_invalid_remote_binding_rejected(client, remote):
-    r = client.post("/v1/tools", json={**NEW_TOOL, "remote": remote})
+    r = client.post("/v1/intents", json={**NEW_INTENT, "remote": remote})
     assert r.status_code == 422
     assert r.json()["error"]["code"] in ("invalid_remote", "validation_error")
-    assert_error(client.get("/v1/tools/add_gift_wrap"), 404, "tool_not_found")
+    assert_error(client.get("/v1/intents/gift_wrap"), 404, "intent_not_found")
 
 
-def test_remote_arguments_rendered_from_tool_arguments():
+def test_remote_arguments_rendered_from_call_arguments():
     template = {"module": "Leads", "criteria": "(Email:equals:{email})", "raw": "{email}", "limit": 1}
     assert mcp_tools.render_arguments(template, {"email": "a@b.co"}) == {
         "module": "Leads", "criteria": "(Email:equals:a@b.co)", "raw": "a@b.co", "limit": 1}
@@ -1307,11 +1267,7 @@ def test_connections_and_their_tools_listed(client):
 def test_slow_remote_tool_times_out_as_a_tool_error(client):
     shipped = json.loads(Path(config.MCP_CONNECTIONS_PATH).read_text())["zoho"]
     write_connections({"zoho": {**shipped, "timeout_seconds": 0.2}})
-    spec = client.get("/v1/tools/search_zoho_lead").json()
-    client.put("/v1/tools/search_zoho_lead", json={
-        "description": spec["description"], "input_schema": spec["input_schema"],
-        "remote": {"connection": "zoho", "tool": "slow_tool"},
-    })
+    rebind(client, "lookup_crm_record", {"connection": "zoho", "tool": "slow_tool"})
     cid = new_call(client)
     start = time.perf_counter()
     r = turn(client, cid, "look me up at jane@example.com")
@@ -1382,12 +1338,7 @@ def test_allowed_tools_limit_bindings_and_calls(client):
     tools = {t["name"]: t["allowed"] for t in client.get("/v1/connections/zoho/tools").json()}
     assert tools["ZohoCRM_searchRecords"] is True and tools["slow_tool"] is False
 
-    spec = client.get("/v1/tools/search_zoho_lead").json()
-    r = client.put("/v1/tools/search_zoho_lead", json={
-        "description": spec["description"], "input_schema": spec["input_schema"],
-        "remote": {"connection": "zoho", "tool": "slow_tool"},
-    })
-    assert_error(r, 422, "invalid_remote")
+    assert_error(rebind(client, "lookup_crm_record", {"connection": "zoho", "tool": "slow_tool"}), 422, "invalid_remote")
     with pytest.raises(mcp_client.ToolCallFailed, match="allowed_tools"):
         mcp_client.call_tool("zoho", "slow_tool", {"email": "a@b.co"})
 
