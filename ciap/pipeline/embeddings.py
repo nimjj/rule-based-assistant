@@ -81,6 +81,12 @@ def invalidate_index():
         _index = None
 
 
+def encode(texts):
+    """Normalized embeddings for `texts`, one row each, from the same model --
+    responder.py reuses it to find the parts of a tool result a call is about."""
+    return _get_model().encode(list(texts), normalize_embeddings=True, convert_to_numpy=True)
+
+
 def retrieve(utterance, top_k=config.RETRIEVAL_TOP_K):
     """Return up to top_k (intent, score) pairs, best first, deduplicated by intent."""
     exemplar_intents, exemplar_matrix = _get_index()
