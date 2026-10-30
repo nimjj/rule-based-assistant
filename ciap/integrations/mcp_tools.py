@@ -14,14 +14,15 @@ from ciap.integrations import mcp_client
 
 def build_tool_call(intent, slots):
     """Resolve a fired frame's intent + extracted slots to a tool call: the
-    intent's name, and its required slots as arguments. Returns None if the
-    intent is no longer in the catalog (deleted mid-call).
+    intent's name, and its slots as arguments (the required ones, and any
+    optional ones that were said). Returns None if the intent is no longer in
+    the catalog (deleted mid-call).
     """
     spec = catalog.intents().get(intent)
     if spec is None:
         return None
     arguments = {}
-    for name in spec["required_slots"]:
+    for name in spec["required_slots"] + spec.get("optional_slots", []):
         value = slots.get(name)
         if value is None:
             continue

@@ -183,6 +183,12 @@ MCP_TOKENS_DIR = os.environ.get("MCP_TOKENS_DIR", os.path.join(ROOT_DIR, "data",
 # Override with the env var of the same name.
 MCP_CALL_TIMEOUT_SECONDS = float(os.environ.get("MCP_CALL_TIMEOUT_SECONDS", "5"))
 
+# CIP mode: tenants' MCP connections must be https and resolve to public
+# addresses. 1/true lifts that, for local development against MCP servers on
+# this machine or network only.
+# Override with the env var of the same name.
+MCP_ALLOW_PRIVATE_HOSTS = os.environ.get("MCP_ALLOW_PRIVATE_HOSTS", "").strip().lower() in ("1", "true", "yes", "on")
+
 # -- responder.py: agent-facing answers for live tool results -----------------
 
 # The Ollama model that turns a live tool's JSON result into a short briefing

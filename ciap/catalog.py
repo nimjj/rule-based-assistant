@@ -13,7 +13,8 @@
 #
 # The pipeline modules read the catalog of the turn in progress through
 # current() / intents(); server.py sets it around each turn with using().
-# Specs keep the built-in shape:
+# Specs keep the built-in shape (`remote`: the MCP tool the intent calls, on a
+# connection of the tenant's own in CIP mode -- see mcp_client):
 #   {"label", "description", "exemplars", "required_slots", "optional_slots", "remote"}
 # and slots(name) is the slot's {"type", "label", "options", "prompt", "description"}.
 
@@ -119,6 +120,8 @@ def from_ciap(tenant_id, body):
             spec["label"] = i["label"]
         if i.get("description"):
             spec["description"] = i["description"]
+        if i.get("remote"):
+            spec["remote"] = i["remote"]  # the tool it calls on one of the tenant's connections (mcp_client)
         intents[i["name"]] = spec
     return Catalog(tenant_id=tenant_id, version=body.get("version", 0), intents=intents, slot_specs=slots,
                    loaded_at=_clock())

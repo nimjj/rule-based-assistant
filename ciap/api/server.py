@@ -941,6 +941,21 @@ class RemoteToolInfo(BaseModel):
     )
 
 
+@app.get(
+    "/v1/tenants/{tenant_id}/connections/{name}/tools", response_model=list[RemoteToolInfo], tags=["connections"],
+    responses={
+        404: {"model": ErrorResponse, "description": "No such connection for the tenant (`connection_not_found`)."},
+        502: {"model": ErrorResponse, "description": "The MCP server couldn't be reached or refused (`connection_failed`)."},
+    },
+)
+def list_tenant_connection_tools(tenant_id: TenantIdPath, name: str):
+    """The tools one of the tenant's connections offers (CIP mode: a connection
+    configured in CIP; otherwise the shared connections file). CIP's Settings
+    use it to pick the tools intents may call."""
+    with catalog.using(_tenant_catalog(tenant_id)):
+        return list_connection_tools(name)
+
+
 @app.get("/v1/connections", response_model=list[str], tags=["connections"])
 def list_connections():
     """Names of the configured MCP connections (`config.MCP_CONNECTIONS_PATH`).

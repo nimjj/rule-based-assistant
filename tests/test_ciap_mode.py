@@ -323,3 +323,118 @@ def test_catalog_from_ciap_maps_the_response():
 def test_slot_extraction_by_type(name, spec, text, value):
     from ciap.pipeline import slots
     assert slots.extract(name, spec, text) == value
+
+
+# -- tenants' own MCP connections ---------------------------------------------------------
+
+LOOKUP = {
+    "name": "lookup_customer", "label": "Customer Lookup", "description": "Find the caller in the CRM by email.",
+    "phrases": ["look me up by email"],
+    "slots": [{"name": "email", "label": "Email", "type": "EMAIL", "required": True, "prompt": None,
+               "description": None, "options": []}],
+    "remote": {"connection": "crm", "tool": "ZohoCRM_searchRecords",
+               "arguments": {"path_variables": {"module": "Leads"}, "query_params": {"email": "{email}"}},
+               "fallback": {"connection": "crm", "tool": "ZohoCRM_searchRecords",
+                            "arguments": {"path_variables": {"module": "Contacts"}, "query_params": {"email": "{email}"}}}},
+}
+
+
+@pytest.fixture
+def crm(fake, monkeypatch):
+    """Tenant A has a "crm" connection (served by test_api's in-process fake
+    Zoho) and an intent that calls it; tenant B has neither."""
+    from ciap.integrations import mcp_client
+
+    fake.catalogs[TENANT_A] = {**CLINIC, "intents": CLINIC["intents"] + [LOOKUP]}
+    fake.connection_reads = []
+    fake.connections = {(TENANT_A, "crm"): {
+        "transport": "streamable_http", "url": "https://crm.example.com/mcp?key=tenant-a-secret-key",
+        "headers": {"X-Org": "org-a-secret"}, "auth": {"type": "bearer", "token": "tenant-a-token"},
+        "timeout_seconds": 5, "allowed_tools": ["ZohoCRM_searchRecords", "slow_tool"],
+        "response": {"status_field": "status", "data_field": "data", "message_field": "message",
+                     "success_values": ["success"], "error_values": ["failure", "error"],
+                     "empty_message_pattern": "Empty response received from API.*Status - 204"},
+    }}
+
+    def get_connection(tenant, name):
+        fake.connection_reads.append((tenant, name))
+        if (tenant, name) not in fake.connections:
+            raise ciap_api.NotFound("No MCP connection", 404)
+        return json.loads(json.dumps(fake.connections[(tenant, name)]))
+
+    monkeypatch.setattr(ciap_api, "get_connection", get_connection)
+    monkeypatch.setattr(config, "MCP_ALLOW_PRIVATE_HOSTS", True)
+    mcp_client._tenant_specs.clear()
+    yield fake
+    mcp_client._tenant_specs.clear()
+
+
+def test_a_tenant_intent_calls_its_tool_on_the_tenants_connection(client, crm):  # noqa: F811
+    v = turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com").json()
+    frame = v["slots"]["frames"][0]
+    assert frame["status"] == "FIRED"
+    assert frame["tool_call"]["arguments"] == {"email": "contact@example.com"}
+    # No lead, so the fallback (Contacts) answers; the envelope is unwrapped per the connection's response setting.
+    assert frame["tool_result"]["status"] == "success"
+    assert frame["tool_result"]["data"]["data"][0]["Account_Name"] == {"name": "King"}
+    assert crm.connection_reads == [(TENANT_A, "crm")]  # read once, then cached for this catalog version
+    client.get(f"/v1/tenants/{TENANT_A}/intents")
+    turn(client, TENANT_A, "c2", "look me up by email, jane@example.com")
+    assert crm.connection_reads == [(TENANT_A, "crm")]
+
+
+def test_a_connection_is_reread_after_the_catalog_version_moves(client, crm):  # noqa: F811
+    turn(client, TENANT_A, "c1", "look me up by email, jane@example.com", catalog_version=3)
+    crm.catalogs[TENANT_A] = {**crm.catalogs[TENANT_A], "version": 4}
+    turn(client, TENANT_A, "c2", "look me up by email, jane@example.com", catalog_version=4)
+    assert crm.connection_reads == [(TENANT_A, "crm"), (TENANT_A, "crm")]
+
+
+def test_a_connection_the_tenant_doesnt_have_is_a_tool_error(client, crm):  # noqa: F811
+    crm.catalogs[TENANT_B] = {**SHOP, "intents": [LOOKUP]}
+    frame = turn(client, TENANT_B, "c1", "look me up by email, jane@example.com").json()["slots"]["frames"][0]
+    assert frame["tool_result"]["status"] == "error" and "not configured" in frame["tool_result"]["message"]
+
+
+def test_tenant_connection_tools_listed(client, crm):  # noqa: F811
+    tools = {t["name"]: t["allowed"] for t in client.get(f"/v1/tenants/{TENANT_A}/connections/crm/tools").json()}
+    assert tools["ZohoCRM_searchRecords"] is True and tools["empty_tool"] is False
+    assert_error(client.get(f"/v1/tenants/{TENANT_B}/connections/crm/tools"), 404, "connection_not_found")
+
+
+def test_a_tenant_connection_secrets_are_redacted(crm):
+    from ciap.integrations import mcp_client
+
+    with catalog.using(catalog.from_ciap(TENANT_A, crm.catalogs[TENANT_A])):
+        _, spec = mcp_client._resolve("crm")
+    text = spec.redact("failed: https://crm.example.com/mcp?key=tenant-a-secret-key token tenant-a-token org-a-secret")
+    assert "tenant-a-secret-key" not in text and "tenant-a-token" not in text and "org-a-secret" not in text
+
+
+@pytest.mark.parametrize("url, addresses, ok", [
+    ("https://crm.example.com/mcp", ["34.120.1.1"], True),
+    ("https://crm.example.com/mcp", ["10.0.0.7"], False),
+    ("https://crm.example.com/mcp", ["34.120.1.1", "169.254.169.254"], False),
+    ("https://crm.example.com/mcp", ["::ffff:127.0.0.1"], False),
+    ("http://crm.example.com/mcp", ["34.120.1.1"], False),
+])
+def test_tenant_connections_only_reach_public_hosts(monkeypatch, url, addresses, ok):
+    import socket
+    from ciap.integrations import mcp_client
+
+    monkeypatch.setattr(config, "MCP_ALLOW_PRIVATE_HOSTS", False)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port, **kw: [(None, None, None, None, (a, port)) for a in addresses])
+    if ok:
+        mcp_client._public_host(url, "URL")
+    else:
+        with pytest.raises(mcp_client.ConnectionNotConfigured):
+            mcp_client._public_host(url, "URL")
+
+
+def test_a_tenant_connection_cant_be_stdio(crm):
+    from ciap.integrations import mcp_client
+
+    crm.connections[(TENANT_A, "crm")] = {"transport": "stdio", "command": "sh"}
+    with catalog.using(catalog.from_ciap(TENANT_A, crm.catalogs[TENANT_A])):
+        with pytest.raises(mcp_client.ConnectionNotConfigured, match="must be HTTP"):
+            mcp_client._resolve("crm")
