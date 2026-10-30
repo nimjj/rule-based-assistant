@@ -16,6 +16,11 @@
 #   GET /api/internal/assist/tenants/{tenant}/connections/{name}
 #       -> one of the tenant's MCP connections, secrets included (mcp_client's
 #          ConnectionSpec shape); 404 for one the tenant doesn't have
+#   POST /api/internal/assist/tenants/{tenant}/connections/{name}/token
+#       {"rejected"} -> {"access_token", "expires_at"}: a current access token for
+#       a connection signed in from CIP (renewed by ciap-api when the stored one
+#       is about to expire or is the rejected one); 409 when an admin has to
+#       sign in again
 
 import threading
 from contextvars import ContextVar
@@ -125,3 +130,6 @@ def save_state(tenant_id, call_id, state, expected_version):
 def get_connection(tenant_id, name):
     return _request("GET", _path(tenant_id) + f"/connections/{quote(name, safe='')}")
 
+
+def connection_token(tenant_id, name, rejected=None):
+    return _request("POST", _path(tenant_id) + f"/connections/{quote(name, safe='')}/token", {"rejected": rejected})

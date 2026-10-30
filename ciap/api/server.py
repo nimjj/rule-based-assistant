@@ -948,11 +948,16 @@ class RemoteToolInfo(BaseModel):
         502: {"model": ErrorResponse, "description": "The MCP server couldn't be reached or refused (`connection_failed`)."},
     },
 )
-def list_tenant_connection_tools(tenant_id: TenantIdPath, name: str):
+def list_tenant_connection_tools(
+    tenant_id: TenantIdPath, name: str,
+    catalog_version: int | None = Query(
+        None, ge=1, description="The tenant's current catalog version (ciap-api sends it), so a connection "
+        "just saved, signed in or signed out isn't served from a cached copy."),
+):
     """The tools one of the tenant's connections offers (CIP mode: a connection
     configured in CIP; otherwise the shared connections file). CIP's Settings
     use it to pick the tools intents may call."""
-    with catalog.using(_tenant_catalog(tenant_id)):
+    with catalog.using(_tenant_catalog(tenant_id, catalog_version)):
         return list_connection_tools(name)
 
 
