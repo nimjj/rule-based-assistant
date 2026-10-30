@@ -438,3 +438,122 @@ def test_a_tenant_connection_cant_be_stdio(crm):
     with catalog.using(catalog.from_ciap(TENANT_A, crm.catalogs[TENANT_A])):
         with pytest.raises(mcp_client.ConnectionNotConfigured, match="must be HTTP"):
             mcp_client._resolve("crm")
+
+
+# -- each turn applied once -------------------------------------------------------------
+
+@pytest.fixture
+def runs(monkeypatch):
+    """Counts how many times the pipeline actually ran a turn."""
+    count = {"n": 0}
+    original = state_store.ConversationStateStore.process_utterance
+
+    def counted(self, *args, **kwargs):
+        count["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(state_store.ConversationStateStore, "process_utterance", counted)
+    return count
+
+
+def test_a_turn_delivered_again_isnt_run_again(client, fake, runs):  # noqa: F811
+    turn(client, TENANT_A, "c1", "I want to book an appointment", turn_id=11)
+    first = turn(client, TENANT_A, "c1", "at 3pm", turn_id=12).json()
+    assert first["slots"]["frames"][0]["status"] == "FIRED"
+    again = turn(client, TENANT_A, "c1", "at 3pm", turn_id=12)
+    assert again.status_code == 200 and again.json() == first
+    assert runs["n"] == 2
+    assert fake.states[(TENANT_A, "c1")][0]["turn_count"] == 2
+
+
+def test_a_conflict_after_another_copy_applied_the_turn_doesnt_run_it_twice(client, fake, runs, monkeypatch):  # noqa: F811
+    turn(client, TENANT_A, "c1", "I want to book an appointment", turn_id=11)
+    real_save = fake.save_state
+
+    def saved_by_the_other_copy_then_conflict(tenant, call, state, expected):
+        # The other delivery of this turn saved first; ours is refused.
+        monkeypatch.setattr(ciap_api, "save_state", real_save)
+        real_save(tenant, call, state, expected)
+        raise ciap_api.StateConflict("moved on", 409)
+
+    monkeypatch.setattr(ciap_api, "save_state", saved_by_the_other_copy_then_conflict)
+    r = turn(client, TENANT_A, "c1", "at 3pm", turn_id=12)
+    assert r.status_code == 200 and r.json()["slots"]["frames"][0]["status"] == "FIRED"
+    assert runs["n"] == 2  # the retry found turn 12 applied
+    assert fake.states[(TENANT_A, "c1")][0]["turn_count"] == 2
+
+
+def test_an_old_turn_whose_response_is_gone_is_refused_not_rerun(client, fake, runs):  # noqa: F811
+    for i in range(1, 8):
+        turn(client, TENANT_A, "c1", "hello", turn_id=i)
+    assert_error(turn(client, TENANT_A, "c1", "hello", turn_id=1), 409, "turn_already_applied")
+    assert turn(client, TENANT_A, "c1", "hello", turn_id=7).status_code == 200
+    assert runs["n"] == 7
+
+
+def test_a_transcript_isnt_rerun_on_a_conflict(client, fake, runs):  # noqa: F811
+    fake.conflicts_left = 1
+    r = client.post(f"/v1/tenants/{TENANT_A}/calls/c1/transcript",
+                    json={"turns": [{"utterance": "I want to book an appointment"}, {"utterance": "at 3pm"}]})
+    assert_error(r, 409, "state_conflict")
+    assert runs["n"] == 2
+
+
+def test_an_unchanged_catalog_keeps_its_embedding_index(fake, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(config, "CATALOG_MAX_AGE_SECONDS", 0)
+    first = catalog.for_tenant(TENANT_A)
+    again = catalog.for_tenant(TENANT_A)
+    assert again is first and len(fake.catalog_loads) == 2
+    fake.catalogs[TENANT_A] = {**CLINIC, "version": CLINIC.get("version", 0) + 1}
+    assert catalog.for_tenant(TENANT_A) is not first
+
+
+# -- tenants' MCP sessions ---------------------------------------------------------------
+
+def _wait_for(check, seconds=2.0):
+    import time
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        if check():
+            return True
+        time.sleep(0.02)
+    return check()
+
+
+def test_two_tenants_with_the_same_connection_name_stay_apart(client, crm):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    crm.catalogs[TENANT_B] = {**SHOP, "intents": SHOP["intents"] + [LOOKUP]}
+    crm.connections[(TENANT_B, "crm")] = {**crm.connections[(TENANT_A, "crm")],
+                                          "url": "https://crm.example.org/mcp?key=tenant-b-secret-key",
+                                          "auth": {"type": "bearer", "token": "tenant-b-token"}}
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    turn(client, TENANT_B, "c1", "look me up by email, it's contact@example.com")
+    sessions = dict(mcp_client._sessions)
+    assert sessions[(TENANT_A, "crm")].spec.url.endswith("tenant-a-secret-key")
+    assert sessions[(TENANT_B, "crm")].spec.url.endswith("tenant-b-secret-key")
+    assert sessions[(TENANT_A, "crm")] is not sessions[(TENANT_B, "crm")]
+
+
+def test_a_connection_deleted_in_cip_closes_its_session(client, crm):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    assert (TENANT_A, "crm") in mcp_client._sessions
+    # Deleting it in CIP moves the tenant's catalog version.
+    del crm.connections[(TENANT_A, "crm")]
+    newer = crm.catalogs[TENANT_A].get("version", 0) + 1
+    crm.catalogs[TENANT_A] = {**crm.catalogs[TENANT_A], "version": newer}
+    turn(client, TENANT_A, "c2", "look me up by email, it's contact@example.com", catalog_version=newer)
+    assert _wait_for(lambda: (TENANT_A, "crm") not in mcp_client._sessions)
+
+
+def test_an_idle_tenants_session_is_closed(client, crm, monkeypatch):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    crm.catalogs[TENANT_B] = {**SHOP, "intents": SHOP["intents"] + [LOOKUP]}
+    crm.connections[(TENANT_B, "crm")] = crm.connections[(TENANT_A, "crm")]
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    monkeypatch.setattr(config, "MCP_SESSION_IDLE_SECONDS", 0)
+    turn(client, TENANT_B, "c1", "look me up by email, it's contact@example.com")
+    assert _wait_for(lambda: (TENANT_A, "crm") not in mcp_client._sessions)

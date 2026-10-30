@@ -317,6 +317,7 @@ def _tenant_spec(tenant_id, name, version):
     try:
         raw = ciap_api.get_connection(tenant_id, name)
     except ciap_api.NotFound:
+        _close_session((tenant_id, name))  # deleted in CIP: don't keep its session (or secrets) open
         raise ConnectionNotConfigured(f"MCP connection {name!r} is not configured for tenant {tenant_id!r}") from None
     except ciap_api.CiapApiError as exc:
         raise ToolCallFailed(f"couldn't read MCP connection {name!r}: {exc}") from None
@@ -845,6 +846,8 @@ class _Session:
         self.name = name
         self.spec = spec
         self.fingerprint = spec.fingerprint()
+        self.last_used = time.monotonic()
+        self.pending = 0
         self.queue = asyncio.Queue()
         self.ready = asyncio.get_running_loop().create_future()
         self.task = asyncio.create_task(self._run())
@@ -902,7 +905,32 @@ class _Session:
         self.queue.put_nowait(None)
 
 
+def _close_session(key):
+    """Close a session from any thread (it's closed on the loop thread)."""
+    if _loop is None:
+        return
+
+    def close():
+        session = _sessions.get(key)
+        if session is not None:
+            logger.info("MCP connection %s removed; closing its session", _label(key))
+            session.close()
+
+    _loop.call_soon_threadsafe(close)
+
+
+def _close_idle():
+    """Close tenants' sessions nobody has used for MCP_SESSION_IDLE_SECONDS.
+    Runs on the loop thread, whenever a call comes in."""
+    now = time.monotonic()
+    for key, session in list(_sessions.items()):
+        if isinstance(key, tuple) and session.pending == 0 and now - session.last_used > config.MCP_SESSION_IDLE_SECONDS:
+            logger.info("MCP connection %s idle; closing its session", _label(key))
+            session.close()
+
+
 async def _submit(name, spec, operation):
+    _close_idle()
     session = _sessions.get(name)
     if session is not None and session.fingerprint != spec.fingerprint():
         # connections.json (or a secret it reads) changed: reconnect with the
@@ -911,11 +939,21 @@ async def _submit(name, spec, operation):
         session.close()
         session = None
     if session is None:
+        if isinstance(name, tuple):
+            # A tenant's server: check where its name points now, not only when the
+            # connection was read (DNS can change while a copy is cached).
+            await asyncio.to_thread(_public_host, spec.url, f"MCP connection {name[1]!r}'s URL")
         session = _sessions[name] = _Session(name, spec)
-    await session.ready
-    future = asyncio.get_running_loop().create_future()
-    session.queue.put_nowait((operation, future))
-    return await future
+    session.pending += 1
+    session.last_used = time.monotonic()
+    try:
+        await session.ready
+        future = asyncio.get_running_loop().create_future()
+        session.queue.put_nowait((operation, future))
+        return await future
+    finally:
+        session.pending -= 1
+        session.last_used = time.monotonic()
 
 
 def _run(name, spec, operation, timeout):

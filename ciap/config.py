@@ -131,7 +131,9 @@ ORG_NAME_MAX_WORDS = 6
 # Override with the env var of the same name.
 CIAP_API_BASE_URL = os.environ.get("CIAP_API_BASE_URL", "").strip().rstrip("/")
 
-# Sent to ciap-api as X-Api-Key (ciap-api's INGEST_API_KEY).
+# Sent to ciap-api as X-Api-Key: ciap-api's AGENT_ASSIST_INTERNAL_API_KEY, the
+# key only this service holds (not the ingestion key). ciap-api refuses these
+# requests while it's unset there.
 # Override with the env var of the same name.
 CIAP_API_KEY = os.environ.get("CIAP_API_KEY", "").strip()
 
@@ -188,6 +190,11 @@ MCP_CALL_TIMEOUT_SECONDS = float(os.environ.get("MCP_CALL_TIMEOUT_SECONDS", "5")
 # this machine or network only.
 # Override with the env var of the same name.
 MCP_ALLOW_PRIVATE_HOSTS = os.environ.get("MCP_ALLOW_PRIVATE_HOSTS", "").strip().lower() in ("1", "true", "yes", "on")
+
+# A tenant's MCP session left unused this long is closed (its socket and the
+# secrets it holds go with it); the next call opens a new one.
+# Override with the env var of the same name.
+MCP_SESSION_IDLE_SECONDS = float(os.environ.get("MCP_SESSION_IDLE_SECONDS", "600"))
 
 # -- responder.py: agent-facing answers for live tool results -----------------
 
