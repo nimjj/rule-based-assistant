@@ -506,3 +506,54 @@ def test_an_unchanged_catalog_keeps_its_embedding_index(fake, monkeypatch):  # n
     assert again is first and len(fake.catalog_loads) == 2
     fake.catalogs[TENANT_A] = {**CLINIC, "version": CLINIC.get("version", 0) + 1}
     assert catalog.for_tenant(TENANT_A) is not first
+
+
+# -- tenants' MCP sessions ---------------------------------------------------------------
+
+def _wait_for(check, seconds=2.0):
+    import time
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        if check():
+            return True
+        time.sleep(0.02)
+    return check()
+
+
+def test_two_tenants_with_the_same_connection_name_stay_apart(client, crm):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    crm.catalogs[TENANT_B] = {**SHOP, "intents": SHOP["intents"] + [LOOKUP]}
+    crm.connections[(TENANT_B, "crm")] = {**crm.connections[(TENANT_A, "crm")],
+                                          "url": "https://crm.example.org/mcp?key=tenant-b-secret-key",
+                                          "auth": {"type": "bearer", "token": "tenant-b-token"}}
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    turn(client, TENANT_B, "c1", "look me up by email, it's contact@example.com")
+    sessions = dict(mcp_client._sessions)
+    assert sessions[(TENANT_A, "crm")].spec.url.endswith("tenant-a-secret-key")
+    assert sessions[(TENANT_B, "crm")].spec.url.endswith("tenant-b-secret-key")
+    assert sessions[(TENANT_A, "crm")] is not sessions[(TENANT_B, "crm")]
+
+
+def test_a_connection_deleted_in_cip_closes_its_session(client, crm):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    assert (TENANT_A, "crm") in mcp_client._sessions
+    # Deleting it in CIP moves the tenant's catalog version.
+    del crm.connections[(TENANT_A, "crm")]
+    newer = crm.catalogs[TENANT_A].get("version", 0) + 1
+    crm.catalogs[TENANT_A] = {**crm.catalogs[TENANT_A], "version": newer}
+    turn(client, TENANT_A, "c2", "look me up by email, it's contact@example.com", catalog_version=newer)
+    assert _wait_for(lambda: (TENANT_A, "crm") not in mcp_client._sessions)
+
+
+def test_an_idle_tenants_session_is_closed(client, crm, monkeypatch):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    crm.catalogs[TENANT_B] = {**SHOP, "intents": SHOP["intents"] + [LOOKUP]}
+    crm.connections[(TENANT_B, "crm")] = crm.connections[(TENANT_A, "crm")]
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    monkeypatch.setattr(config, "MCP_SESSION_IDLE_SECONDS", 0)
+    turn(client, TENANT_B, "c1", "look me up by email, it's contact@example.com")
+    assert _wait_for(lambda: (TENANT_A, "crm") not in mcp_client._sessions)

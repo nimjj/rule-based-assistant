@@ -191,6 +191,11 @@ MCP_CALL_TIMEOUT_SECONDS = float(os.environ.get("MCP_CALL_TIMEOUT_SECONDS", "5")
 # Override with the env var of the same name.
 MCP_ALLOW_PRIVATE_HOSTS = os.environ.get("MCP_ALLOW_PRIVATE_HOSTS", "").strip().lower() in ("1", "true", "yes", "on")
 
+# A tenant's MCP session left unused this long is closed (its socket and the
+# secrets it holds go with it); the next call opens a new one.
+# Override with the env var of the same name.
+MCP_SESSION_IDLE_SECONDS = float(os.environ.get("MCP_SESSION_IDLE_SECONDS", "600"))
+
 # -- responder.py: agent-facing answers for live tool results -----------------
 
 # The Ollama model that turns a live tool's JSON result into a short briefing
