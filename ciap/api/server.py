@@ -39,6 +39,7 @@ from ciap import catalog
 from ciap import ciap_api
 from ciap import config
 from ciap.integrations import mcp_client
+from ciap.integrations import mcp_tools
 from ciap.api import views
 from ciap.api.demo_web import router as demo_router
 from ciap.pipeline.slots import SLOT_EXTRACTORS
@@ -423,6 +424,13 @@ class CallSession:
         self.turn_count = 0
         self.applied_ids: list[int] = []
         self.responses: dict[str, dict] = {}  # turn id -> its response, newest last
+        # Turns that called (or were about to call) a tool, and the one doing so
+        # now: see _claim_turn.
+        self.claimed_ids: list[int] = []
+        self.in_progress: dict | None = None
+        # CIP mode: the state as loaded and its version, for a claim and the save.
+        self.loaded_state: dict | None = None
+        self.version = 0
         self.last_activity = _now()
         # One in-flight turn per call: process_utterance mutates the frame list.
         self.lock = threading.Lock()
@@ -436,11 +444,16 @@ class CallSession:
             session.turn_count = int(state.get("turn_count") or 0)
             session.applied_ids = [int(i) for i in state.get("applied_turn_ids") or []]
             session.responses = dict(state.get("turn_responses") or {})
+            session.claimed_ids = [int(i) for i in state.get("claimed_turn_ids") or []]
+            session.in_progress = state.get("in_progress")
+        session.loaded_state = state
         return session
 
     def to_state(self):
+        # A finished request leaves no turn in progress.
         return {"store": views.to_jsonable(self.store.to_dict()), "turn_count": self.turn_count,
-                "applied_turn_ids": self.applied_ids, "turn_responses": self.responses}
+                "applied_turn_ids": self.applied_ids, "turn_responses": self.responses,
+                "claimed_turn_ids": self.claimed_ids, "in_progress": None}
 
     def applied(self, turn_id):
         """(already applied, the response it got if still kept)."""
@@ -606,30 +619,80 @@ def _locked_call(key: CallKey, *, create: bool, source: str = "turn", user_id: s
     except ciap_api.CiapApiError as exc:
         raise ApiError(503, "state_unavailable", f"Couldn't load call {key[1]!r}'s state; retry. ({exc})") from exc
     session = CallSession.from_state(state)
+    session.version = version
     yield session
     if save:
         try:
-            ciap_api.save_state(*key, session.to_state(), version)
+            # session.version: moved on by a claim (_claim_turn) during the request.
+            ciap_api.save_state(*key, session.to_state(), session.version)
         except ciap_api.StateConflict:
             raise
         except ciap_api.CiapApiError as exc:
             raise ApiError(503, "state_unavailable", f"Couldn't save call {key[1]!r}'s state; retry. ({exc})") from exc
 
 
+class TurnInProgress(Exception):
+    """Another copy of this turn has claimed it and is calling its tool now."""
+
+
 def _retrying(key: CallKey, work):
     """Run `work()` (which uses _locked_call), once more if ciap-api refused
-    its save because the call moved on meanwhile. Turns for one call arrive
-    in order, one at a time, so this is only a request seen twice -- and a turn
-    carries its id, so the second run finds it applied and returns its response
-    instead of running it again."""
-    try:
-        return work()
-    except ciap_api.StateConflict:
-        logger.warning("%s state changed while a request ran; running it again on the new state", _who(key))
-    try:
-        return work()
-    except ciap_api.StateConflict as exc:
-        raise ApiError(409, "state_conflict", f"Call {key[1]!r} kept changing while this request ran; resend it.") from exc
+    its save (or a claim) because the call moved on meanwhile. Turns for one
+    call arrive in order, one at a time, so this is only a request seen twice
+    -- and a turn carries its id, so the second run finds it applied and
+    returns its response instead of running it again. While another copy of
+    the turn is still running (it claimed it), wait for it, up to
+    TURN_IN_PROGRESS_WAIT_SECONDS, and return what it saved."""
+    conflicts = 0
+    waiting_since = None
+    while True:
+        try:
+            return work()
+        except ciap_api.StateConflict as exc:
+            conflicts += 1
+            if conflicts > 1:
+                raise ApiError(409, "state_conflict", f"Call {key[1]!r} kept changing while this request ran; resend it.") from exc
+            logger.warning("%s state changed while a request ran; running it again on the new state", _who(key))
+        except TurnInProgress as exc:
+            waiting_since = waiting_since or time.monotonic()
+            if time.monotonic() - waiting_since > config.TURN_IN_PROGRESS_WAIT_SECONDS:
+                raise ApiError(409, "turn_in_progress", f"{exc} Resend it later for its response.") from None
+            time.sleep(0.25)
+
+
+def _turn_claim(key: CallKey, session: CallSession, turn_id: int | None):
+    """What runs before the turn's first tool call (mcp_tools.before_remote_call).
+
+    CIP mode, with a turn id: the call's state as loaded is saved again, marked
+    "turn_id in progress" and with turn_id among the claimed turns, at the
+    loaded version. Only one copy of a turn can save that, so only one calls
+    the tool; the other's claim is refused (StateConflict) before anything is
+    sent. Turns that call no tool never claim (no extra save). Raises
+    TurnInProgress / ApiError up front when another copy holds or used the turn.
+    """
+    if not ciap_api.enabled() or turn_id is None:
+        return None
+    current = session.in_progress or {}
+    if current.get("turn_id") == turn_id and time.time() - float(current.get("since") or 0) < config.TURN_CLAIM_STALE_SECONDS:
+        raise TurnInProgress(f"Turn {turn_id} of call {key[1]!r} is being run by another request.")
+    if turn_id in session.claimed_ids:
+        # Claimed earlier, never saved as applied: that copy may have called the
+        # tool before it was lost. Not called a second time.
+        raise ApiError(409, "turn_claim_lost",
+                       f"Turn {turn_id} of call {key[1]!r} already called its tool but its result was lost; it isn't run again.")
+    claimed = []
+
+    def claim():
+        if claimed:
+            return
+        state = dict(session.loaded_state or {})
+        state["claimed_turn_ids"] = ([int(i) for i in state.get("claimed_turn_ids") or []] + [turn_id])[-CallSession.APPLIED_IDS_KEPT:]
+        state["in_progress"] = {"turn_id": turn_id, "since": time.time()}
+        session.version = ciap_api.save_state(*key, state, session.version)
+        session.claimed_ids = state["claimed_turn_ids"]
+        claimed.append(True)
+
+    return claim
 
 
 def _once(key: CallKey, work):
@@ -654,14 +717,22 @@ def _run_turn(
         if response is None:
             raise ApiError(409, "turn_already_applied", f"Turn {turn_id} was already applied to call {key[1]!r}.")
         return response
+    claim = _turn_claim(key, session, turn_id)
+    hook = mcp_tools.before_remote_call.set(claim)
     try:
         trace = session.store.process_utterance(text, speaker=speaker, answer_mode=answer_mode)
+    except (ciap_api.StateConflict, TurnInProgress):
+        raise  # lost the claim to another copy of this turn: _retrying sorts it out
+    except ciap_api.CiapApiError as exc:
+        raise ApiError(503, "state_unavailable", f"Couldn't claim turn {turn_id} of call {key[1]!r}; retry. ({exc})") from exc
     except Exception as exc:
         logger.exception("%s process_utterance failed (%d chars)", _who(key, user_id), len(text))
         call_log.log_event(
             "turn_error", **_ids(key, user_id), utterance=text, error=f"{type(exc).__name__}: {exc}"
         )
         raise ApiError(500, "pipeline_error", f"Couldn't process that turn ({type(exc).__name__}).") from exc
+    finally:
+        mcp_tools.before_remote_call.reset(hook)
     session.turn_count += 1
     session.touch()
     view = views.build_turn_view(trace, session.store, session.turn_count)
