@@ -22,6 +22,7 @@ intent_test_results.xlsx
 # Docs are kept local only (docs/: API_DOCUMENTATION.md, PDFs, openapi.json)
 docs/
 *.md
+!SETUP.md
 *.pdf
 
 # Editors / OS / tools
