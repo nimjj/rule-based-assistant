@@ -119,12 +119,39 @@ NAME_JOIN_WORDS = ["and", "&", "of", "the"]
 # Longest run of words captured as a single company or deal name.
 ORG_NAME_MAX_WORDS = 6
 
-# -- catalog.py: admin-edited intent catalog ----------------------------------
+# -- catalog.py / ciap_api.py: where intents and call state come from ---------
 
-# Where edits made through the /v1/intents write endpoints are saved. Loaded
-# over the defaults in intents.py at startup when present; delete it to go
-# back to those defaults.
-CATALOG_PATH = os.path.join(ROOT_DIR, "data", "catalog.json")
+# ciap-api's base URL (e.g. https://ciap.snet.internal). When set, the service
+# runs in CIP mode: each tenant's intents, phrases and slots come from ciap-api
+# (GET /api/internal/assist/tenants/{tenant}/catalog) and each call's state is
+# loaded from and saved back to it before and after every turn, so the service
+# keeps nothing between turns and any number of instances can serve a call.
+# Unset: the built-in catalog (intents.py) for every tenant and call state in
+# this process's memory -- local development, the demo and the tests only.
+# Override with the env var of the same name.
+CIAP_API_BASE_URL = os.environ.get("CIAP_API_BASE_URL", "").strip().rstrip("/")
+
+# Sent to ciap-api as X-Api-Key (ciap-api's INGEST_API_KEY).
+# Override with the env var of the same name.
+CIAP_API_KEY = os.environ.get("CIAP_API_KEY", "").strip()
+
+# The longest one request to ciap-api (catalog, load or save state) waits.
+# Override with the env var of the same name.
+CIAP_API_TIMEOUT_SECONDS = float(os.environ.get("CIAP_API_TIMEOUT_SECONDS", "5"))
+
+# A tenant's catalog is reloaded at once when a turn carries a newer
+# catalog_version (ciap-api bumps it on every save). This is the backstop for
+# turns sent without one: the longest a cached catalog is used before it is
+# reloaded anyway.
+# Override with the env var of the same name.
+CATALOG_MAX_AGE_SECONDS = float(os.environ.get("CATALOG_MAX_AGE_SECONDS", "300"))
+
+# -- server.py: inbound auth -----------------------------------------------------
+
+# When set, every /v1 request must send it as X-Api-Key (ciap-kafka sends its
+# agent-assist.api.key). Unset: open, for local development only.
+# Override with the env var of the same name.
+API_KEY = os.environ.get("AGENT_ASSIST_API_KEY", "").strip()
 
 # -- mcp_client.py: remote MCP servers for live tools -------------------------
 
@@ -220,8 +247,9 @@ RESPONDER_NUM_CTX = int(os.environ.get("RESPONDER_NUM_CTX") or (0 if RESPONDER_P
 
 # -- server.py: call memory ----------------------------------------------------
 
-# A call with no activity (turn, transcript, slot override, reset) for this
-# many seconds is dropped from memory; reads of it then get 404
+# Built-in mode only (in CIP mode ciap-api keeps each call's state). A call
+# with no activity (turn, transcript, slot override, reset) for this many
+# seconds is dropped from memory; reads of it then get 404
 # `call_expired`, and a new turn starts it over empty. Reading state
 # (GET /v1/tenants/{tenant_id}/calls/{call_id}) doesn't count as activity.
 # 30 min leaves room for long holds; PBXware's hangup should still DELETE the

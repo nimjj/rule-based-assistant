@@ -1,7 +1,8 @@
 # Step 1: Intent retrieval via sentence embeddings.
 #
-# Each intent is represented by a handful of exemplar utterances (see
-# intents.py). We embed every exemplar once at startup, then for each
+# Each intent is represented by a handful of exemplar utterances (the
+# tenant's catalog, see catalog.py). We embed a catalog's exemplars once, the
+# first time a turn uses it, then for each
 # incoming utterance we embed it and compare against all exemplars with
 # cosine similarity. An intent's score is the similarity to its single
 # closest exemplar (max, not average) so one great exemplar match is enough.
@@ -18,11 +19,12 @@
 # second exemplar catalogue to keep in sync.
 
 import threading
+import weakref
 
 from sentence_transformers import SentenceTransformer
 
+from ciap import catalog
 from ciap import config
-from ciap.pipeline.intents import INTENTS
 
 MODEL_NAME = config.EMBEDDING_MODEL_NAME  # small, fast, CPU-friendly
 
@@ -37,10 +39,10 @@ MODEL_NAME = config.EMBEDDING_MODEL_NAME  # small, fast, CPU-friendly
 # AWAITING_INFO frame's slot actually get filled instead.
 
 _model = None
-# (exemplar_intents, exemplar_matrix), swapped in as one tuple so a turn never
-# sees intents from one build and vectors from another. None = (re)build on
-# the next retrieve(); catalog.py sets that after an admin edit.
-_index = None
+# Catalog -> (exemplar_intents, exemplar_matrix). Catalogs are never edited in
+# place (a tenant's new version is a new Catalog), so an index stays valid for
+# its catalog's lifetime and goes with it once the cache drops it.
+_indexes = weakref.WeakKeyDictionary()
 _index_lock = threading.Lock()
 
 
@@ -51,34 +53,26 @@ def _get_model():
     return _model
 
 
-def _build_index():
-    # Copy first: catalog.py replaces specs wholesale rather than mutating
-    # them, so this snapshot is consistent even mid-edit.
+def _build_index(cat):
     texts, intents = [], []
-    for intent, spec in dict(INTENTS).items():
+    for intent, spec in cat.intents.items():
         for text in spec["exemplars"]:
             texts.append(text)
             intents.append(intent)
+    if not texts:
+        return [], None
     matrix = _get_model().encode(texts, normalize_embeddings=True, convert_to_numpy=True)
     return intents, matrix
 
 
-def _get_index():
-    global _index
-    index = _index
+def _get_index(cat):
+    index = _indexes.get(cat)
     if index is None:
         with _index_lock:
-            if _index is None:
-                _index = _build_index()
-            index = _index
+            index = _indexes.get(cat)
+            if index is None:
+                index = _indexes[cat] = _build_index(cat)
     return index
-
-
-def invalidate_index():
-    """Drop the exemplar index; the next retrieve() re-embeds the catalog."""
-    global _index
-    with _index_lock:
-        _index = None
 
 
 def encode(texts):
@@ -88,8 +82,11 @@ def encode(texts):
 
 
 def retrieve(utterance, top_k=config.RETRIEVAL_TOP_K):
-    """Return up to top_k (intent, score) pairs, best first, deduplicated by intent."""
-    exemplar_intents, exemplar_matrix = _get_index()
+    """Return up to top_k (intent, score) pairs, best first, deduplicated by
+    intent, from the catalog of the turn in progress."""
+    exemplar_intents, exemplar_matrix = _get_index(catalog.current())
+    if exemplar_matrix is None:
+        return []  # a tenant with no intents
 
     model = _get_model()
     query_vec = model.encode([utterance], normalize_embeddings=True, convert_to_numpy=True)[0]

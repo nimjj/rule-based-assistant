@@ -8,8 +8,8 @@
 
 import re
 
+from ciap import catalog
 from ciap.integrations import mcp_client
-from ciap.pipeline.intents import INTENTS
 
 
 def build_tool_call(intent, slots):
@@ -17,7 +17,7 @@ def build_tool_call(intent, slots):
     intent's name, and its required slots as arguments. Returns None if the
     intent is no longer in the catalog (deleted mid-call).
     """
-    spec = INTENTS.get(intent)
+    spec = catalog.intents().get(intent)
     if spec is None:
         return None
     arguments = {}
@@ -72,7 +72,7 @@ def remote_calls(tool_call):
     """The (connection, remote tool, arguments) a tool call executes as --
     its binding, then each fallback in turn -- or [] for a mock tool."""
     calls = []
-    remote = INTENTS.get(tool_call["tool"], {}).get("remote")
+    remote = catalog.intents().get(tool_call["tool"], {}).get("remote")
     while remote is not None:
         template = remote.get("arguments")
         arguments = tool_call["arguments"] if template is None else render_arguments(template, tool_call["arguments"])
@@ -82,7 +82,7 @@ def remote_calls(tool_call):
 
 
 def executes_live(tool_name):
-    return INTENTS.get(tool_name, {}).get("remote") is not None
+    return catalog.intents().get(tool_name, {}).get("remote") is not None
 
 
 NO_RESULTS_MESSAGE = "The tool ran but found no results."
