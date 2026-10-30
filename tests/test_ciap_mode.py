@@ -438,3 +438,71 @@ def test_a_tenant_connection_cant_be_stdio(crm):
     with catalog.using(catalog.from_ciap(TENANT_A, crm.catalogs[TENANT_A])):
         with pytest.raises(mcp_client.ConnectionNotConfigured, match="must be HTTP"):
             mcp_client._resolve("crm")
+
+
+# -- each turn applied once -------------------------------------------------------------
+
+@pytest.fixture
+def runs(monkeypatch):
+    """Counts how many times the pipeline actually ran a turn."""
+    count = {"n": 0}
+    original = state_store.ConversationStateStore.process_utterance
+
+    def counted(self, *args, **kwargs):
+        count["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(state_store.ConversationStateStore, "process_utterance", counted)
+    return count
+
+
+def test_a_turn_delivered_again_isnt_run_again(client, fake, runs):  # noqa: F811
+    turn(client, TENANT_A, "c1", "I want to book an appointment", turn_id=11)
+    first = turn(client, TENANT_A, "c1", "at 3pm", turn_id=12).json()
+    assert first["slots"]["frames"][0]["status"] == "FIRED"
+    again = turn(client, TENANT_A, "c1", "at 3pm", turn_id=12)
+    assert again.status_code == 200 and again.json() == first
+    assert runs["n"] == 2
+    assert fake.states[(TENANT_A, "c1")][0]["turn_count"] == 2
+
+
+def test_a_conflict_after_another_copy_applied_the_turn_doesnt_run_it_twice(client, fake, runs, monkeypatch):  # noqa: F811
+    turn(client, TENANT_A, "c1", "I want to book an appointment", turn_id=11)
+    real_save = fake.save_state
+
+    def saved_by_the_other_copy_then_conflict(tenant, call, state, expected):
+        # The other delivery of this turn saved first; ours is refused.
+        monkeypatch.setattr(ciap_api, "save_state", real_save)
+        real_save(tenant, call, state, expected)
+        raise ciap_api.StateConflict("moved on", 409)
+
+    monkeypatch.setattr(ciap_api, "save_state", saved_by_the_other_copy_then_conflict)
+    r = turn(client, TENANT_A, "c1", "at 3pm", turn_id=12)
+    assert r.status_code == 200 and r.json()["slots"]["frames"][0]["status"] == "FIRED"
+    assert runs["n"] == 2  # the retry found turn 12 applied
+    assert fake.states[(TENANT_A, "c1")][0]["turn_count"] == 2
+
+
+def test_an_old_turn_whose_response_is_gone_is_refused_not_rerun(client, fake, runs):  # noqa: F811
+    for i in range(1, 8):
+        turn(client, TENANT_A, "c1", "hello", turn_id=i)
+    assert_error(turn(client, TENANT_A, "c1", "hello", turn_id=1), 409, "turn_already_applied")
+    assert turn(client, TENANT_A, "c1", "hello", turn_id=7).status_code == 200
+    assert runs["n"] == 7
+
+
+def test_a_transcript_isnt_rerun_on_a_conflict(client, fake, runs):  # noqa: F811
+    fake.conflicts_left = 1
+    r = client.post(f"/v1/tenants/{TENANT_A}/calls/c1/transcript",
+                    json={"turns": [{"utterance": "I want to book an appointment"}, {"utterance": "at 3pm"}]})
+    assert_error(r, 409, "state_conflict")
+    assert runs["n"] == 2
+
+
+def test_an_unchanged_catalog_keeps_its_embedding_index(fake, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(config, "CATALOG_MAX_AGE_SECONDS", 0)
+    first = catalog.for_tenant(TENANT_A)
+    again = catalog.for_tenant(TENANT_A)
+    assert again is first and len(fake.catalog_loads) == 2
+    fake.catalogs[TENANT_A] = {**CLINIC, "version": CLINIC.get("version", 0) + 1}
+    assert catalog.for_tenant(TENANT_A) is not first

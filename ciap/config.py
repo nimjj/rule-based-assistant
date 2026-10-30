@@ -131,7 +131,9 @@ ORG_NAME_MAX_WORDS = 6
 # Override with the env var of the same name.
 CIAP_API_BASE_URL = os.environ.get("CIAP_API_BASE_URL", "").strip().rstrip("/")
 
-# Sent to ciap-api as X-Api-Key (ciap-api's INGEST_API_KEY).
+# Sent to ciap-api as X-Api-Key: ciap-api's AGENT_ASSIST_INTERNAL_API_KEY, the
+# key only this service holds (not the ingestion key). ciap-api refuses these
+# requests while it's unset there.
 # Override with the env var of the same name.
 CIAP_API_KEY = os.environ.get("CIAP_API_KEY", "").strip()
 

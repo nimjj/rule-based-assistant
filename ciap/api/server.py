@@ -207,6 +207,13 @@ class TurnRequest(BaseModel):
     user_id: UserId | None = _USER_ID_FIELD
     answer_mode: AnswerMode | None = _ANSWER_MODE_FIELD
     catalog_version: int | None = _CATALOG_VERSION_FIELD
+    turn_id: int | None = Field(
+        default=None, ge=1,
+        description=(
+            "The turn's id in CIP. A turn whose id the call has already applied isn't run again (no second "
+            "tool call): the response it got the first time is returned. CIP sends it; optional otherwise."
+        ),
+    )
 
 
 class TranscriptTurn(BaseModel):
@@ -406,9 +413,16 @@ _now = time.monotonic  # patched in tests
 
 
 class CallSession:
+    # Applied turn ids kept per call, and how many of the latest turns' responses
+    # are kept to answer a repeat with (state size stays small).
+    APPLIED_IDS_KEPT = 500
+    RESPONSES_KEPT = 5
+
     def __init__(self):
         self.store = ConversationStateStore()
         self.turn_count = 0
+        self.applied_ids: list[int] = []
+        self.responses: dict[str, dict] = {}  # turn id -> its response, newest last
         self.last_activity = _now()
         # One in-flight turn per call: process_utterance mutates the frame list.
         self.lock = threading.Lock()
@@ -420,10 +434,27 @@ class CallSession:
         if state:
             session.store = ConversationStateStore.from_dict(state.get("store"))
             session.turn_count = int(state.get("turn_count") or 0)
+            session.applied_ids = [int(i) for i in state.get("applied_turn_ids") or []]
+            session.responses = dict(state.get("turn_responses") or {})
         return session
 
     def to_state(self):
-        return {"store": views.to_jsonable(self.store.to_dict()), "turn_count": self.turn_count}
+        return {"store": views.to_jsonable(self.store.to_dict()), "turn_count": self.turn_count,
+                "applied_turn_ids": self.applied_ids, "turn_responses": self.responses}
+
+    def applied(self, turn_id):
+        """(already applied, the response it got if still kept)."""
+        if turn_id is None or turn_id not in self.applied_ids:
+            return False, None
+        return True, self.responses.get(str(turn_id))
+
+    def remember(self, turn_id, view):
+        if turn_id is None:
+            return
+        self.applied_ids = (self.applied_ids + [turn_id])[-self.APPLIED_IDS_KEPT:]
+        self.responses[str(turn_id)] = views.to_jsonable(view)
+        for old in list(self.responses)[:-self.RESPONSES_KEPT]:
+            del self.responses[old]
 
     def touch(self):
         self.last_activity = _now()
@@ -588,7 +619,9 @@ def _locked_call(key: CallKey, *, create: bool, source: str = "turn", user_id: s
 def _retrying(key: CallKey, work):
     """Run `work()` (which uses _locked_call), once more if ciap-api refused
     its save because the call moved on meanwhile. Turns for one call arrive
-    in order, one at a time, so this is only a request seen twice."""
+    in order, one at a time, so this is only a request seen twice -- and a turn
+    carries its id, so the second run finds it applied and returns its response
+    instead of running it again."""
     try:
         return work()
     except ciap_api.StateConflict:
@@ -599,12 +632,28 @@ def _retrying(key: CallKey, work):
         raise ApiError(409, "state_conflict", f"Call {key[1]!r} kept changing while this request ran; resend it.") from exc
 
 
+def _once(key: CallKey, work):
+    """Run `work()` without retrying: for requests whose turns carry no ids, so
+    a conflict can't be told apart from a request seen twice. 409 to the caller."""
+    try:
+        return work()
+    except ciap_api.StateConflict as exc:
+        raise ApiError(409, "state_conflict", f"Call {key[1]!r} changed while this request ran; check it and resend.") from exc
+
+
 def _run_turn(
     key: CallKey, session: CallSession, text: str, speaker: str, user_id: str | None = None, debug: bool = False,
-    answer_mode: str | None = None,
+    answer_mode: str | None = None, turn_id: int | None = None,
 ) -> dict:
     """Process one turn. The caller holds the call (_locked_call) and has set
-    its tenant's catalog (catalog.using)."""
+    its tenant's catalog (catalog.using). A turn id the call has already
+    applied isn't run again."""
+    done, response = session.applied(turn_id)
+    if done:
+        logger.info("%s turn id %s already applied; not running it again", _who(key, user_id), turn_id)
+        if response is None:
+            raise ApiError(409, "turn_already_applied", f"Turn {turn_id} was already applied to call {key[1]!r}.")
+        return response
     try:
         trace = session.store.process_utterance(text, speaker=speaker, answer_mode=answer_mode)
     except Exception as exc:
@@ -630,8 +679,9 @@ def _run_turn(
     call_log.log_event(
         "turn", **_ids(key, user_id), turn_index=view["turn_index"], utterance=text, view=view, raw_trace=raw
     )
+    session.remember(turn_id, view)
     if debug:
-        view["debug"] = raw
+        view = {**view, "debug": raw}
     return view
 
 
@@ -830,7 +880,8 @@ def post_turn(
 
     def work():
         with catalog.using(cat), _locked_call(key, create=True, user_id=turn.user_id) as session:
-            return _run_turn(key, session, turn.utterance, turn.speaker, turn.user_id, debug, turn.answer_mode)
+            return _run_turn(key, session, turn.utterance, turn.speaker, turn.user_id, debug, turn.answer_mode,
+                             turn.turn_id)
 
     return _retrying(key, work)
 
@@ -873,7 +924,8 @@ def post_transcript(tenant_id: TenantIdPath, call_id: CallIdPath, body: Transcri
             return {"tenant_id": tenant_id, "call_id": call_id, "turns": results,
                     "frames": views.frames_view(session.store)}
 
-    return _retrying(key, work)
+    # Not retried: re-running the turns would repeat their tool calls.
+    return _once(key, work)
 
 
 # -- catalog ------------------------------------------------------------------
@@ -1042,28 +1094,34 @@ def override_slot(tenant_id: str, call_id: str, frame_id: int, slot_name: str, b
         raise ApiError(404, "endpoint_disabled", "Slot override is archived and disabled on this server.")
     key, user_id = (tenant_id, call_id), body.user_id
     cat = _tenant_catalog(tenant_id)
-    with catalog.using(cat), _locked_call(key, create=False) as session:
-        store = session.store
-        frame = store.get_frame(frame_id)
-        if frame is None:
-            raise ApiError(404, "frame_not_found", f"No frame #{frame_id} in call {call_id!r}.")
-        if frame.status == "REVERTED":
-            raise ApiError(409, "frame_reverted", f"Frame #{frame_id} was reverted; nothing to override.")
-        if slot_name not in cat.intents.get(frame.intent, {}).get("required_slots", []):
-            raise ApiError(422, "invalid_slot", f"{slot_name!r} isn't a slot on {frame.intent}.")
 
-        try:
-            frame, refired = store.override_slot(frame_id, slot_name, body.value)
-        except ValueError as exc:
-            call_log.log_event(
-                "override_rejected", **_ids(key, user_id), frame_id=frame_id, slot=slot_name,
-                value=body.value, error=str(exc),
-            )
-            raise ApiError(422, "invalid_slot_value", str(exc)) from exc
+    def work():
+        with catalog.using(cat), _locked_call(key, create=False) as session:
+            store = session.store
+            frame = store.get_frame(frame_id)
+            if frame is None:
+                raise ApiError(404, "frame_not_found", f"No frame #{frame_id} in call {call_id!r}.")
+            if frame.status == "REVERTED":
+                raise ApiError(409, "frame_reverted", f"Frame #{frame_id} was reverted; nothing to override.")
+            if slot_name not in cat.intents.get(frame.intent, {}).get("required_slots", []):
+                raise ApiError(422, "invalid_slot", f"{slot_name!r} isn't a slot on {frame.intent}.")
 
-        session.turn_count += 1
-        session.touch()
-        view = views.build_turn_view(views.build_override_trace(frame, slot_name, refired), store, session.turn_count)
+            try:
+                frame, refired = store.override_slot(frame_id, slot_name, body.value)
+            except ValueError as exc:
+                call_log.log_event(
+                    "override_rejected", **_ids(key, user_id), frame_id=frame_id, slot=slot_name,
+                    value=body.value, error=str(exc),
+                )
+                raise ApiError(422, "invalid_slot_value", str(exc)) from exc
+
+            session.turn_count += 1
+            session.touch()
+            view = views.build_turn_view(views.build_override_trace(frame, slot_name, refired), store, session.turn_count)
+            return frame, refired, view
+
+    # Not retried: a re-run would dispatch the corrected tool call again.
+    frame, refired, view = _once(key, work)
 
     logger.info(
         "%s turn=%d override %s#%d.%s -> %r%s",
