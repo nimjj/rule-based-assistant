@@ -7,6 +7,7 @@
 # server (see the binding notes below, and mcp_client.py).
 
 import re
+from contextvars import ContextVar
 
 from ciap import catalog
 from ciap.integrations import mcp_client
@@ -14,14 +15,15 @@ from ciap.integrations import mcp_client
 
 def build_tool_call(intent, slots):
     """Resolve a fired frame's intent + extracted slots to a tool call: the
-    intent's name, and its required slots as arguments. Returns None if the
-    intent is no longer in the catalog (deleted mid-call).
+    intent's name, and its slots as arguments (the required ones, and any
+    optional ones that were said). Returns None if the intent is no longer in
+    the catalog (deleted mid-call).
     """
     spec = catalog.intents().get(intent)
     if spec is None:
         return None
     arguments = {}
-    for name in spec["required_slots"]:
+    for name in spec["required_slots"] + spec.get("optional_slots", []):
         value = slots.get(name)
         if value is None:
             continue
@@ -108,6 +110,12 @@ def tool_result(status, data=None, message=None):
     return {"status": status, "data": data, "message": message}
 
 
+# Called once, before a turn's first call to a remote tool (ciap/api/server.py
+# claims the turn there, so two copies of one turn can't both call the tool).
+# It may raise to stop the turn before anything is sent.
+before_remote_call: ContextVar = ContextVar("before_remote_call", default=None)
+
+
 def dispatch_tool_call(tool_call):
     """Execute a fired frame's tool call on its remote MCP tool -- trying each
     fallback in turn while nothing is found -- and return its tool_result (see
@@ -119,6 +127,9 @@ def dispatch_tool_call(tool_call):
     calls = remote_calls(tool_call)
     if not calls:
         return None
+    hook = before_remote_call.get()
+    if hook is not None:
+        hook()  # outside the try below: a refused claim stops the turn, it isn't a tool error
     # The binding, then its fallbacks while each finds nothing.
     for connection, remote_tool, arguments in calls:
         try:

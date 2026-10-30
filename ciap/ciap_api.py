@@ -13,6 +13,9 @@
 #   PUT /api/internal/assist/tenants/{tenant}/calls/{call}/state
 #       {"expectedVersion", "state"} -> {"version"}; 409 when the call's state
 #       moved on since it was loaded
+#   GET /api/internal/assist/tenants/{tenant}/connections/{name}
+#       -> one of the tenant's MCP connections, secrets included (mcp_client's
+#          ConnectionSpec shape); 404 for one the tenant doesn't have
 
 import threading
 from contextvars import ContextVar
@@ -117,3 +120,8 @@ def save_state(tenant_id, call_id, state, expected_version):
     version. StateConflict otherwise."""
     body = _request("PUT", _path(tenant_id, call_id) + "/state", {"expectedVersion": expected_version, "state": state})
     return int(body["version"])
+
+
+def get_connection(tenant_id, name):
+    return _request("GET", _path(tenant_id) + f"/connections/{quote(name, safe='')}")
+

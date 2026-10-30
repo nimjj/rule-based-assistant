@@ -325,6 +325,121 @@ def test_slot_extraction_by_type(name, spec, text, value):
     assert slots.extract(name, spec, text) == value
 
 
+# -- tenants' own MCP connections ---------------------------------------------------------
+
+LOOKUP = {
+    "name": "lookup_customer", "label": "Customer Lookup", "description": "Find the caller in the CRM by email.",
+    "phrases": ["look me up by email"],
+    "slots": [{"name": "email", "label": "Email", "type": "EMAIL", "required": True, "prompt": None,
+               "description": None, "options": []}],
+    "remote": {"connection": "crm", "tool": "ZohoCRM_searchRecords",
+               "arguments": {"path_variables": {"module": "Leads"}, "query_params": {"email": "{email}"}},
+               "fallback": {"connection": "crm", "tool": "ZohoCRM_searchRecords",
+                            "arguments": {"path_variables": {"module": "Contacts"}, "query_params": {"email": "{email}"}}}},
+}
+
+
+@pytest.fixture
+def crm(fake, monkeypatch):
+    """Tenant A has a "crm" connection (served by test_api's in-process fake
+    Zoho) and an intent that calls it; tenant B has neither."""
+    from ciap.integrations import mcp_client
+
+    fake.catalogs[TENANT_A] = {**CLINIC, "intents": CLINIC["intents"] + [LOOKUP]}
+    fake.connection_reads = []
+    fake.connections = {(TENANT_A, "crm"): {
+        "transport": "streamable_http", "url": "https://crm.example.com/mcp?key=tenant-a-secret-key",
+        "headers": {"X-Org": "org-a-secret"}, "auth": {"type": "bearer", "token": "tenant-a-token"},
+        "timeout_seconds": 5, "allowed_tools": ["ZohoCRM_searchRecords", "slow_tool"],
+        "response": {"status_field": "status", "data_field": "data", "message_field": "message",
+                     "success_values": ["success"], "error_values": ["failure", "error"],
+                     "empty_message_pattern": "Empty response received from API.*Status - 204"},
+    }}
+
+    def get_connection(tenant, name):
+        fake.connection_reads.append((tenant, name))
+        if (tenant, name) not in fake.connections:
+            raise ciap_api.NotFound("No MCP connection", 404)
+        return json.loads(json.dumps(fake.connections[(tenant, name)]))
+
+    monkeypatch.setattr(ciap_api, "get_connection", get_connection)
+    monkeypatch.setattr(config, "MCP_ALLOW_PRIVATE_HOSTS", True)
+    mcp_client._tenant_specs.clear()
+    yield fake
+    mcp_client._tenant_specs.clear()
+
+
+def test_a_tenant_intent_calls_its_tool_on_the_tenants_connection(client, crm):  # noqa: F811
+    v = turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com").json()
+    frame = v["slots"]["frames"][0]
+    assert frame["status"] == "FIRED"
+    assert frame["tool_call"]["arguments"] == {"email": "contact@example.com"}
+    # No lead, so the fallback (Contacts) answers; the envelope is unwrapped per the connection's response setting.
+    assert frame["tool_result"]["status"] == "success"
+    assert frame["tool_result"]["data"]["data"][0]["Account_Name"] == {"name": "King"}
+    assert crm.connection_reads == [(TENANT_A, "crm")]  # read once, then cached for this catalog version
+    client.get(f"/v1/tenants/{TENANT_A}/intents")
+    turn(client, TENANT_A, "c2", "look me up by email, jane@example.com")
+    assert crm.connection_reads == [(TENANT_A, "crm")]
+
+
+def test_a_connection_is_reread_after_the_catalog_version_moves(client, crm):  # noqa: F811
+    turn(client, TENANT_A, "c1", "look me up by email, jane@example.com", catalog_version=3)
+    crm.catalogs[TENANT_A] = {**crm.catalogs[TENANT_A], "version": 4}
+    turn(client, TENANT_A, "c2", "look me up by email, jane@example.com", catalog_version=4)
+    assert crm.connection_reads == [(TENANT_A, "crm"), (TENANT_A, "crm")]
+
+
+def test_a_connection_the_tenant_doesnt_have_is_a_tool_error(client, crm):  # noqa: F811
+    crm.catalogs[TENANT_B] = {**SHOP, "intents": [LOOKUP]}
+    frame = turn(client, TENANT_B, "c1", "look me up by email, jane@example.com").json()["slots"]["frames"][0]
+    assert frame["tool_result"]["status"] == "error" and "not configured" in frame["tool_result"]["message"]
+
+
+def test_tenant_connection_tools_listed(client, crm):  # noqa: F811
+    tools = {t["name"]: t["allowed"] for t in client.get(f"/v1/tenants/{TENANT_A}/connections/crm/tools").json()}
+    assert tools["ZohoCRM_searchRecords"] is True and tools["empty_tool"] is False
+    assert_error(client.get(f"/v1/tenants/{TENANT_B}/connections/crm/tools"), 404, "connection_not_found")
+
+
+def test_a_tenant_connection_secrets_are_redacted(crm):
+    from ciap.integrations import mcp_client
+
+    with catalog.using(catalog.from_ciap(TENANT_A, crm.catalogs[TENANT_A])):
+        _, spec = mcp_client._resolve("crm")
+    text = spec.redact("failed: https://crm.example.com/mcp?key=tenant-a-secret-key token tenant-a-token org-a-secret")
+    assert "tenant-a-secret-key" not in text and "tenant-a-token" not in text and "org-a-secret" not in text
+
+
+@pytest.mark.parametrize("url, addresses, ok", [
+    ("https://crm.example.com/mcp", ["34.120.1.1"], True),
+    ("https://crm.example.com/mcp", ["10.0.0.7"], False),
+    ("https://crm.example.com/mcp", ["34.120.1.1", "169.254.169.254"], False),
+    ("https://crm.example.com/mcp", ["::ffff:127.0.0.1"], False),
+    ("http://crm.example.com/mcp", ["34.120.1.1"], False),
+])
+def test_tenant_connections_only_reach_public_hosts(monkeypatch, url, addresses, ok):
+    import socket
+    from ciap.integrations import mcp_client
+
+    monkeypatch.setattr(config, "MCP_ALLOW_PRIVATE_HOSTS", False)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port, **kw: [(None, None, None, None, (a, port)) for a in addresses])
+    if ok:
+        mcp_client._public_host(url, "URL")
+    else:
+        with pytest.raises(mcp_client.ConnectionNotConfigured):
+            mcp_client._public_host(url, "URL")
+
+
+def test_a_tenant_connection_cant_be_stdio(crm):
+    from ciap.integrations import mcp_client
+
+    crm.connections[(TENANT_A, "crm")] = {"transport": "stdio", "command": "sh"}
+    with catalog.using(catalog.from_ciap(TENANT_A, crm.catalogs[TENANT_A])):
+        with pytest.raises(mcp_client.ConnectionNotConfigured, match="must be HTTP"):
+            mcp_client._resolve("crm")
+
+
 # -- each turn applied once -------------------------------------------------------------
 
 @pytest.fixture
@@ -391,3 +506,153 @@ def test_an_unchanged_catalog_keeps_its_embedding_index(fake, monkeypatch):  # n
     assert again is first and len(fake.catalog_loads) == 2
     fake.catalogs[TENANT_A] = {**CLINIC, "version": CLINIC.get("version", 0) + 1}
     assert catalog.for_tenant(TENANT_A) is not first
+
+
+# -- tenants' MCP sessions ---------------------------------------------------------------
+
+def _wait_for(check, seconds=2.0):
+    import time
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        if check():
+            return True
+        time.sleep(0.02)
+    return check()
+
+
+def test_two_tenants_with_the_same_connection_name_stay_apart(client, crm):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    crm.catalogs[TENANT_B] = {**SHOP, "intents": SHOP["intents"] + [LOOKUP]}
+    crm.connections[(TENANT_B, "crm")] = {**crm.connections[(TENANT_A, "crm")],
+                                          "url": "https://crm.example.org/mcp?key=tenant-b-secret-key",
+                                          "auth": {"type": "bearer", "token": "tenant-b-token"}}
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    turn(client, TENANT_B, "c1", "look me up by email, it's contact@example.com")
+    sessions = dict(mcp_client._sessions)
+    assert sessions[(TENANT_A, "crm")].spec.url.endswith("tenant-a-secret-key")
+    assert sessions[(TENANT_B, "crm")].spec.url.endswith("tenant-b-secret-key")
+    assert sessions[(TENANT_A, "crm")] is not sessions[(TENANT_B, "crm")]
+
+
+def test_a_connection_deleted_in_cip_closes_its_session(client, crm):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    assert (TENANT_A, "crm") in mcp_client._sessions
+    # Deleting it in CIP moves the tenant's catalog version.
+    del crm.connections[(TENANT_A, "crm")]
+    newer = crm.catalogs[TENANT_A].get("version", 0) + 1
+    crm.catalogs[TENANT_A] = {**crm.catalogs[TENANT_A], "version": newer}
+    turn(client, TENANT_A, "c2", "look me up by email, it's contact@example.com", catalog_version=newer)
+    assert _wait_for(lambda: (TENANT_A, "crm") not in mcp_client._sessions)
+
+
+def test_an_idle_tenants_session_is_closed(client, crm, monkeypatch):  # noqa: F811
+    from ciap.integrations import mcp_client
+
+    crm.catalogs[TENANT_B] = {**SHOP, "intents": SHOP["intents"] + [LOOKUP]}
+    crm.connections[(TENANT_B, "crm")] = crm.connections[(TENANT_A, "crm")]
+    turn(client, TENANT_A, "c1", "look me up by email, it's contact@example.com")
+    monkeypatch.setattr(config, "MCP_SESSION_IDLE_SECONDS", 0)
+    turn(client, TENANT_B, "c1", "look me up by email, it's contact@example.com")
+    assert _wait_for(lambda: (TENANT_A, "crm") not in mcp_client._sessions)
+
+
+# -- one tool call per turn, across copies of the turn -------------------------------------
+
+@pytest.fixture
+def tool_calls(monkeypatch):
+    from ciap.integrations import mcp_client
+
+    calls = []
+    real = mcp_client.call_tool
+
+    def counted(connection, tool, arguments, timeout=None):
+        calls.append(tool)
+        return real(connection, tool, arguments, timeout)
+
+    monkeypatch.setattr(mcp_client, "call_tool", counted)
+    return calls
+
+
+LOOK_ME_UP = "look me up by email, it's contact@example.com"
+
+
+def _finish_elsewhere(fake, key, turn_id, response, after=0.3):
+    """Another copy of the turn finishes (saves it applied) a moment later."""
+    import threading
+    import time as _time
+
+    def finish():
+        _time.sleep(after)
+        state, version = fake.states[key]
+        done = {**state, "applied_turn_ids": (state.get("applied_turn_ids") or []) + [turn_id],
+                "turn_responses": {str(turn_id): response}, "in_progress": None}
+        fake.states[key] = (done, version + 1)
+
+    threading.Thread(target=finish, daemon=True).start()
+
+
+def test_a_tool_turn_claims_itself_then_saves(client, crm, tool_calls):  # noqa: F811
+    turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=21)
+    state, version = crm.states[(TENANT_A, "c1")]
+    assert version == 2  # the claim, then the turn
+    assert state["claimed_turn_ids"] == [21] and state["in_progress"] is None and state["applied_turn_ids"] == [21]
+    assert tool_calls  # called (with its fallback when nothing is found), once per binding
+
+
+def test_a_turn_without_a_tool_doesnt_claim(client, crm):  # noqa: F811
+    turn(client, TENANT_A, "c1", "I want to book an appointment", turn_id=31)
+    state, version = crm.states[(TENANT_A, "c1")]
+    assert version == 1 and state["claimed_turn_ids"] == []
+
+
+def test_a_copy_of_a_turn_another_request_is_running_waits_for_its_response(client, crm, tool_calls, monkeypatch):  # noqa: F811
+    import time as _time
+
+    theirs = {**turn(client, TENANT_A, "c1", "hello", turn_id=40).json(), "utterance": "the other copy's response"}
+    state, version = crm.states[(TENANT_A, "c1")]
+    crm.states[(TENANT_A, "c1")] = ({**state, "claimed_turn_ids": [41], "in_progress": {"turn_id": 41, "since": _time.time()}}, version + 1)
+    _finish_elsewhere(crm, (TENANT_A, "c1"), 41, theirs)
+    r = turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=41)
+    assert r.status_code == 200 and r.json()["utterance"] == "the other copy's response"
+    assert tool_calls == []
+
+
+def test_losing_the_claim_race_calls_no_tool(client, crm, tool_calls, monkeypatch):  # noqa: F811
+    import time as _time
+
+    theirs = {**turn(client, TENANT_A, "c1", "hello", turn_id=50).json(), "utterance": "the other copy's response"}
+    real_save = crm.save_state
+
+    def other_copy_claims_first(tenant, call, state, expected):
+        if state.get("in_progress"):  # our claim: the other copy's got there first
+            monkeypatch.setattr(ciap_api, "save_state", real_save)
+            current, version = crm.states.get((tenant, call), (None, 0))
+            other = {**(current or {}), "claimed_turn_ids": [51], "in_progress": {"turn_id": 51, "since": _time.time()}}
+            crm.states[(tenant, call)] = (other, version + 1)
+            _finish_elsewhere(crm, (tenant, call), 51, theirs)
+            raise ciap_api.StateConflict("moved on", 409)
+        return real_save(tenant, call, state, expected)
+
+    monkeypatch.setattr(ciap_api, "save_state", other_copy_claims_first)
+    r = turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=51)
+    assert r.status_code == 200 and r.json()["utterance"] == "the other copy's response"
+    assert tool_calls == []
+
+
+def test_a_claimed_turn_whose_result_was_lost_isnt_run_again(client, crm, tool_calls):  # noqa: F811
+    crm.states[(TENANT_A, "c1")] = ({"turn_count": 0, "claimed_turn_ids": [61], "in_progress": None}, 3)
+    assert_error(turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=61), 409, "turn_claim_lost")
+    assert tool_calls == []
+
+
+def test_an_abandoned_claim_is_taken_over(client, crm, tool_calls, monkeypatch):  # noqa: F811
+    import time as _time
+
+    crm.states[(TENANT_A, "c1")] = ({"turn_count": 0, "in_progress": {"turn_id": 71, "since": _time.time() - 600}}, 3)
+    monkeypatch.setattr(config, "TURN_IN_PROGRESS_WAIT_SECONDS", 1)
+    # Stale claims of a *different* request are taken over; the turn runs.
+    r = turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=72)
+    assert r.status_code == 200 and tool_calls
