@@ -20,7 +20,11 @@
 # Connections) and read from ciap-api with their secrets when a tool is
 # called, for the tenant of the turn in progress (catalog.current()). They
 # are HTTP only (no stdio) and their hosts must resolve to public addresses
-# (config.MCP_ALLOW_PRIVATE_HOSTS lifts that for local development).
+# (config.MCP_ALLOW_PRIVATE_HOSTS lifts that for local development). One that
+# signs in with the provider (cip_sign_in) is signed in from CIP: ciap-api
+# keeps the sign-in and renews it, and this service only ever holds an access
+# token, asking ciap-api for a current one when it's about to expire or the
+# server refuses it.
 # Otherwise every tenant shares config.MCP_CONNECTIONS_PATH.
 #
 # The MCP SDK is async and turn handling is sync (FastAPI runs our handlers in
@@ -63,6 +67,10 @@ class ConnectionNotConfigured(Exception):
 
 class ToolCallFailed(Exception):
     pass
+
+
+class ServerToolError(ToolCallFailed):
+    """The server answered with a JSON-RPC error: the connection itself is fine."""
 
 
 class SignInRequired(ToolCallFailed):
@@ -125,6 +133,19 @@ class McpOAuthAuth(_Strict):
         return self
 
 
+class CipSignInAuth(_Strict):
+    """A tenant connection signed in from CIP ("Sign in with the provider").
+    Only ever from ciap-api, never in the connections file: the refresh token
+    stays in ciap-api, which hands out current access tokens (_cip_sign_in).
+    access_token is None until an admin signs in. signed_in_at changes only
+    when someone signs in or out, so a session is rebuilt then but not on
+    every token renewal."""
+    type: Literal["cip_sign_in"]
+    access_token: str | None = None
+    expires_at: float | None = None  # epoch seconds
+    signed_in_at: float | None = None  # epoch seconds
+
+
 class ResponseSpec(_Strict):
     """For servers that wrap every result in their own envelope, e.g. Zoho's
     {"status": "success", "data": {...}}. A result is treated as enveloped
@@ -144,7 +165,7 @@ class ConnectionSpec(_Strict):
     command: str | None = None
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
-    auth: Annotated[BearerAuth | OAuth2Auth | McpOAuthAuth, Field(discriminator="type")] | None = None
+    auth: Annotated[BearerAuth | OAuth2Auth | McpOAuthAuth | CipSignInAuth, Field(discriminator="type")] | None = None
     timeout_seconds: float | None = Field(None, gt=0, le=120)
     allowed_tools: list[str] | None = None
     response: ResponseSpec | None = None
@@ -164,7 +185,10 @@ class ConnectionSpec(_Strict):
         return self
 
     def fingerprint(self):
-        return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
+        # A renewed access token isn't a config change: the open session keeps
+        # renewing its own (see _cip_sign_in).
+        exclude = {"auth": {"access_token", "expires_at"}} if isinstance(self.auth, CipSignInAuth) else None
+        return hashlib.sha256(self.model_dump_json(exclude=exclude).encode()).hexdigest()
 
     def redact(self, text):
         for secret in sorted(self._secrets, key=len, reverse=True):
@@ -234,6 +258,8 @@ def _connection_spec(name):
             f"{'.'.join(str(part) for part in err['loc']) or 'connection'}: {err['msg']}" for err in exc.errors()
         )
         raise ConnectionNotConfigured(f"MCP connection {name!r} is invalid: {problems}") from None
+    if isinstance(spec.auth, CipSignInAuth):
+        raise ConnectionNotConfigured(f'MCP connection {name!r}: "cip_sign_in" is only for connections configured in CIP')
     spec._secrets = secrets
     return spec
 
@@ -301,12 +327,15 @@ def _tenant_spec(tenant_id, name, version):
         problems = "; ".join(f"{'.'.join(str(p) for p in err['loc']) or 'connection'}: {err['msg']}" for err in exc.errors())
         raise ConnectionNotConfigured(f"MCP connection {name!r} is invalid: {problems}") from None
     if spec.transport == "stdio" or isinstance(spec.auth, McpOAuthAuth):
-        raise ConnectionNotConfigured(f"MCP connection {name!r}: a tenant connection must be HTTP with none, bearer or oauth2 sign-in")
+        raise ConnectionNotConfigured(
+            f"MCP connection {name!r}: a tenant connection must be HTTP with none, bearer, oauth2 or cip_sign_in sign-in")
     secrets = [spec.url, *spec.headers.values()]
     if isinstance(spec.auth, BearerAuth):
         secrets.append(spec.auth.token)
     elif isinstance(spec.auth, OAuth2Auth):
         secrets += [spec.auth.client_secret, spec.auth.refresh_token]
+    elif isinstance(spec.auth, CipSignInAuth):
+        secrets.append(spec.auth.access_token)
     spec._secrets = [s for s in secrets if s]
     # The URL itself can carry a key, so its query and path stay out of messages.
     spec._secrets += [p for p in (urlparse(spec.url).query, urlparse(spec.url).path) if p and len(p) > 8]
@@ -538,6 +567,83 @@ def _mcp_oauth(name, spec):
     return Flow()
 
 
+# -- cip_sign_in: tokens from ciap-api ------------------------------------------------
+
+# Why a cip_sign_in connection couldn't get a token: session key -> (message,
+# when). The MCP SDK reports a failure inside the HTTP auth flow only as
+# "Connection closed", so _run reports this instead -- for calls already under
+# way when it happened, never for later calls or a server's own tool error.
+_auth_failures: dict = {}
+
+
+def _auth_failure_since(key, started):
+    hit = _auth_failures.get(key)
+    return hit[0] if hit and hit[1] >= started else None
+
+
+def _use_until(expires_at, fresh):
+    """Until when to use a token: REFRESH_MARGIN before it expires. A token
+    ciap-api has just handed out (fresh) is used for at least half its
+    remaining life, so a provider's short-lived tokens aren't "about to
+    expire" the moment they arrive and asked for again on every request."""
+    if expires_at is None:
+        return None
+    if not fresh:
+        return expires_at - _REFRESH_MARGIN_SECONDS
+    return expires_at - min(_REFRESH_MARGIN_SECONDS, max(0.0, expires_at - time.time()) / 2)
+
+
+def _cip_sign_in(key, spec):
+    """An httpx Auth for a tenant connection signed in from CIP: the access
+    token ciap-api gave with the connection, and a current one from ciap-api
+    when it's about to expire or the server answers 401. ciap-api renews the
+    sign-in once for every worker and instance (it locks the connection while
+    renewing), so asking again after another worker renewed just returns the
+    renewed token."""
+    import httpx2
+
+    if not isinstance(key, tuple):
+        raise ConnectionNotConfigured('"cip_sign_in" is only for connections configured in CIP')
+    tenant_id, name = key
+    state = {"token": spec.auth.access_token, "use_until": _use_until(spec.auth.expires_at, fresh=False)}
+    lock = asyncio.Lock()
+
+    def usable():
+        return state["token"] and (state["use_until"] is None or time.time() < state["use_until"])
+
+    def failed(message):
+        _auth_failures[key] = (message, time.monotonic())
+        return ToolCallFailed(message)
+
+    async def access_token(rejected=None):
+        async with lock:
+            if usable() and state["token"] != rejected:
+                return state["token"]
+            try:
+                fresh = await asyncio.to_thread(ciap_api.connection_token, tenant_id, name, rejected or state["token"])
+            except ciap_api.CiapApiError as exc:
+                if exc.status == 409:
+                    raise failed(f"MCP connection {name!r} isn't signed in: an admin needs to sign in under "
+                                 "Settings -> Agent Assist -> Connections") from None
+                raise failed(f"MCP connection {name!r}: couldn't get a current sign-in from ciap-api ({exc})") from None
+            state.update(token=fresh.get("access_token"), use_until=_use_until(fresh.get("expires_at"), fresh=True))
+            if not state["token"]:
+                raise failed(f"MCP connection {name!r} isn't signed in")
+            spec._secrets.append(state["token"])
+            return state["token"]
+
+    class Flow(httpx2.Auth):
+        async def async_auth_flow(self, request):
+            token = await access_token()
+            request.headers["Authorization"] = f"Bearer {token}"
+            response = yield request
+            if response.status_code == 401:
+                request.headers["Authorization"] = f"Bearer {await access_token(rejected=token)}"
+                yield request
+
+    return Flow()
+
+
 def sign_in(name, show_sign_in_page, timeout_seconds=300):
     """The one-time browser sign-in for an mcp_oauth connection: the MCP SDK's
     standard flow (discovery, registration when there's no client_id, PKCE),
@@ -677,6 +783,8 @@ async def _http_transport(spec, name=None, auth=None):
             auth = _oauth2(spec.auth, name=name)
         elif isinstance(spec.auth, McpOAuthAuth):
             auth = _mcp_oauth(name, spec)
+        elif isinstance(spec.auth, CipSignInAuth):
+            auth = _cip_sign_in(name, spec)
     # The SDK's default HTTP timeouts (long reads, for the server's event
     # stream); per-call limits are applied in call_tool / list_tools.
     if spec.transport == "sse":
@@ -780,7 +888,7 @@ class _Session:
         except MCPError as exc:
             # A JSON-RPC error from the server: the session itself is fine.
             if not future.done():
-                future.set_exception(ToolCallFailed(str(exc)))
+                future.set_exception(ServerToolError(str(exc)))
             return
         except Exception as exc:
             # Transport trouble: reconnect on the next call.
@@ -849,17 +957,26 @@ async def _submit(name, spec, operation):
 
 
 def _run(name, spec, operation, timeout):
+    started = time.monotonic()
     future = asyncio.run_coroutine_threadsafe(_submit(name, spec, operation), _ensure_loop())
     try:
         return future.result(timeout=timeout)
     except FutureTimeout:
         future.cancel()
         raise ToolCallFailed(f"MCP connection {_label(name)!r} didn't answer within {timeout:g}s") from None
-    except (ToolCallFailed, ConnectionNotConfigured):
+    except ConnectionNotConfigured:
+        raise
+    except ServerToolError:
+        raise
+    except ToolCallFailed:
+        reason = _auth_failure_since(name, started)
+        if reason:
+            raise ToolCallFailed(reason) from None
         raise
     except Exception as exc:
         # Transport errors can quote the URL, which may carry a key.
-        raise ToolCallFailed(spec.redact(_describe(exc))) from None
+        reason = _auth_failure_since(name, started)
+        raise ToolCallFailed(reason or spec.redact(_describe(exc))) from None
 
 
 def shutdown():
