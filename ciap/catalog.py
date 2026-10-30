@@ -155,6 +155,11 @@ def for_tenant(tenant_id, min_version=None):
                 logger.warning("tenant=%s catalog reload failed, using version %s: %s", tenant_id, cached.version, exc)
                 return cached
             raise CatalogUnavailable(f"Couldn't load tenant {tenant_id!r}'s catalog: {exc}") from exc
+        if cached is not None and loaded.version == cached.version:
+            # Unchanged (every change in CIP moves the version): keep the copy whose
+            # embedding index is already built, instead of re-embedding every phrase.
+            cached.loaded_at = loaded.loaded_at
+            return cached
         _cache[tenant_id] = loaded
         logger.info("tenant=%s catalog version %s loaded (%d intents)", tenant_id, loaded.version, len(loaded.intents))
         return loaded

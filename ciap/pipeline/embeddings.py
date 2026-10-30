@@ -43,6 +43,9 @@ _model = None
 # place (a tenant's new version is a new Catalog), so an index stays valid for
 # its catalog's lifetime and goes with it once the cache drops it.
 _indexes = weakref.WeakKeyDictionary()
+# One build lock per catalog, so one tenant's catalog being embedded doesn't
+# hold up turns for another; _index_lock only guards handing them out.
+_build_locks = weakref.WeakKeyDictionary()
 _index_lock = threading.Lock()
 
 
@@ -69,6 +72,8 @@ def _get_index(cat):
     index = _indexes.get(cat)
     if index is None:
         with _index_lock:
+            lock = _build_locks.setdefault(cat, threading.Lock())
+        with lock:
             index = _indexes.get(cat)
             if index is None:
                 index = _indexes[cat] = _build_index(cat)
