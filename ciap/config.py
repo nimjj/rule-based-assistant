@@ -191,6 +191,15 @@ MCP_CALL_TIMEOUT_SECONDS = float(os.environ.get("MCP_CALL_TIMEOUT_SECONDS", "5")
 # Override with the env var of the same name.
 MCP_ALLOW_PRIVATE_HOSTS = os.environ.get("MCP_ALLOW_PRIVATE_HOSTS", "").strip().lower() in ("1", "true", "yes", "on")
 
+# CIP mode: a turn that calls a tool claims it first (saved with the call's
+# state), so another copy of the same turn can't call the tool too. That copy
+# waits up to TURN_IN_PROGRESS_WAIT_SECONDS for the first to finish and returns
+# its response; a claim older than TURN_CLAIM_STALE_SECONDS is treated as
+# abandoned (the instance holding it died).
+# Override with the env vars of the same names.
+TURN_IN_PROGRESS_WAIT_SECONDS = float(os.environ.get("TURN_IN_PROGRESS_WAIT_SECONDS", "30"))
+TURN_CLAIM_STALE_SECONDS = float(os.environ.get("TURN_CLAIM_STALE_SECONDS", "120"))
+
 # A tenant's MCP session left unused this long is closed (its socket and the
 # secrets it holds go with it); the next call opens a new one.
 # Override with the env var of the same name.

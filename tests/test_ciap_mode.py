@@ -557,3 +557,102 @@ def test_an_idle_tenants_session_is_closed(client, crm, monkeypatch):  # noqa: F
     monkeypatch.setattr(config, "MCP_SESSION_IDLE_SECONDS", 0)
     turn(client, TENANT_B, "c1", "look me up by email, it's contact@example.com")
     assert _wait_for(lambda: (TENANT_A, "crm") not in mcp_client._sessions)
+
+
+# -- one tool call per turn, across copies of the turn -------------------------------------
+
+@pytest.fixture
+def tool_calls(monkeypatch):
+    from ciap.integrations import mcp_client
+
+    calls = []
+    real = mcp_client.call_tool
+
+    def counted(connection, tool, arguments, timeout=None):
+        calls.append(tool)
+        return real(connection, tool, arguments, timeout)
+
+    monkeypatch.setattr(mcp_client, "call_tool", counted)
+    return calls
+
+
+LOOK_ME_UP = "look me up by email, it's contact@example.com"
+
+
+def _finish_elsewhere(fake, key, turn_id, response, after=0.3):
+    """Another copy of the turn finishes (saves it applied) a moment later."""
+    import threading
+    import time as _time
+
+    def finish():
+        _time.sleep(after)
+        state, version = fake.states[key]
+        done = {**state, "applied_turn_ids": (state.get("applied_turn_ids") or []) + [turn_id],
+                "turn_responses": {str(turn_id): response}, "in_progress": None}
+        fake.states[key] = (done, version + 1)
+
+    threading.Thread(target=finish, daemon=True).start()
+
+
+def test_a_tool_turn_claims_itself_then_saves(client, crm, tool_calls):  # noqa: F811
+    turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=21)
+    state, version = crm.states[(TENANT_A, "c1")]
+    assert version == 2  # the claim, then the turn
+    assert state["claimed_turn_ids"] == [21] and state["in_progress"] is None and state["applied_turn_ids"] == [21]
+    assert tool_calls  # called (with its fallback when nothing is found), once per binding
+
+
+def test_a_turn_without_a_tool_doesnt_claim(client, crm):  # noqa: F811
+    turn(client, TENANT_A, "c1", "I want to book an appointment", turn_id=31)
+    state, version = crm.states[(TENANT_A, "c1")]
+    assert version == 1 and state["claimed_turn_ids"] == []
+
+
+def test_a_copy_of_a_turn_another_request_is_running_waits_for_its_response(client, crm, tool_calls, monkeypatch):  # noqa: F811
+    import time as _time
+
+    theirs = {**turn(client, TENANT_A, "c1", "hello", turn_id=40).json(), "utterance": "the other copy's response"}
+    state, version = crm.states[(TENANT_A, "c1")]
+    crm.states[(TENANT_A, "c1")] = ({**state, "claimed_turn_ids": [41], "in_progress": {"turn_id": 41, "since": _time.time()}}, version + 1)
+    _finish_elsewhere(crm, (TENANT_A, "c1"), 41, theirs)
+    r = turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=41)
+    assert r.status_code == 200 and r.json()["utterance"] == "the other copy's response"
+    assert tool_calls == []
+
+
+def test_losing_the_claim_race_calls_no_tool(client, crm, tool_calls, monkeypatch):  # noqa: F811
+    import time as _time
+
+    theirs = {**turn(client, TENANT_A, "c1", "hello", turn_id=50).json(), "utterance": "the other copy's response"}
+    real_save = crm.save_state
+
+    def other_copy_claims_first(tenant, call, state, expected):
+        if state.get("in_progress"):  # our claim: the other copy's got there first
+            monkeypatch.setattr(ciap_api, "save_state", real_save)
+            current, version = crm.states.get((tenant, call), (None, 0))
+            other = {**(current or {}), "claimed_turn_ids": [51], "in_progress": {"turn_id": 51, "since": _time.time()}}
+            crm.states[(tenant, call)] = (other, version + 1)
+            _finish_elsewhere(crm, (tenant, call), 51, theirs)
+            raise ciap_api.StateConflict("moved on", 409)
+        return real_save(tenant, call, state, expected)
+
+    monkeypatch.setattr(ciap_api, "save_state", other_copy_claims_first)
+    r = turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=51)
+    assert r.status_code == 200 and r.json()["utterance"] == "the other copy's response"
+    assert tool_calls == []
+
+
+def test_a_claimed_turn_whose_result_was_lost_isnt_run_again(client, crm, tool_calls):  # noqa: F811
+    crm.states[(TENANT_A, "c1")] = ({"turn_count": 0, "claimed_turn_ids": [61], "in_progress": None}, 3)
+    assert_error(turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=61), 409, "turn_claim_lost")
+    assert tool_calls == []
+
+
+def test_an_abandoned_claim_is_taken_over(client, crm, tool_calls, monkeypatch):  # noqa: F811
+    import time as _time
+
+    crm.states[(TENANT_A, "c1")] = ({"turn_count": 0, "in_progress": {"turn_id": 71, "since": _time.time() - 600}}, 3)
+    monkeypatch.setattr(config, "TURN_IN_PROGRESS_WAIT_SECONDS", 1)
+    # Stale claims of a *different* request are taken over; the turn runs.
+    r = turn(client, TENANT_A, "c1", LOOK_ME_UP, turn_id=72)
+    assert r.status_code == 200 and tool_calls
