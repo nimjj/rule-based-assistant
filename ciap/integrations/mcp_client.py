@@ -69,6 +69,10 @@ class ToolCallFailed(Exception):
     pass
 
 
+class ServerToolError(ToolCallFailed):
+    """The server answered with a JSON-RPC error: the connection itself is fine."""
+
+
 class SignInRequired(ToolCallFailed):
     """An mcp_oauth connection has no usable saved sign-in."""
 
@@ -133,10 +137,13 @@ class CipSignInAuth(_Strict):
     """A tenant connection signed in from CIP ("Sign in with the provider").
     Only ever from ciap-api, never in the connections file: the refresh token
     stays in ciap-api, which hands out current access tokens (_cip_sign_in).
-    access_token is None until an admin signs in."""
+    access_token is None until an admin signs in. signed_in_at changes only
+    when someone signs in or out, so a session is rebuilt then but not on
+    every token renewal."""
     type: Literal["cip_sign_in"]
     access_token: str | None = None
     expires_at: float | None = None  # epoch seconds
+    signed_in_at: float | None = None  # epoch seconds
 
 
 class ResponseSpec(_Strict):
@@ -178,7 +185,10 @@ class ConnectionSpec(_Strict):
         return self
 
     def fingerprint(self):
-        return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
+        # A renewed access token isn't a config change: the open session keeps
+        # renewing its own (see _cip_sign_in).
+        exclude = {"auth": {"access_token", "expires_at"}} if isinstance(self.auth, CipSignInAuth) else None
+        return hashlib.sha256(self.model_dump_json(exclude=exclude).encode()).hexdigest()
 
     def redact(self, text):
         for secret in sorted(self._secrets, key=len, reverse=True):
@@ -558,10 +568,28 @@ def _mcp_oauth(name, spec):
 
 # -- cip_sign_in: tokens from ciap-api ------------------------------------------------
 
-# Why a cip_sign_in connection couldn't get a token, by session key: the MCP
-# SDK reports a failure inside the HTTP auth flow only as "Connection closed",
-# so _run reports this instead.
+# Why a cip_sign_in connection couldn't get a token: session key -> (message,
+# when). The MCP SDK reports a failure inside the HTTP auth flow only as
+# "Connection closed", so _run reports this instead -- for calls already under
+# way when it happened, never for later calls or a server's own tool error.
 _auth_failures: dict = {}
+
+
+def _auth_failure_since(key, started):
+    hit = _auth_failures.get(key)
+    return hit[0] if hit and hit[1] >= started else None
+
+
+def _use_until(expires_at, fresh):
+    """Until when to use a token: REFRESH_MARGIN before it expires. A token
+    ciap-api has just handed out (fresh) is used for at least half its
+    remaining life, so a provider's short-lived tokens aren't "about to
+    expire" the moment they arrive and asked for again on every request."""
+    if expires_at is None:
+        return None
+    if not fresh:
+        return expires_at - _REFRESH_MARGIN_SECONDS
+    return expires_at - min(_REFRESH_MARGIN_SECONDS, max(0.0, expires_at - time.time()) / 2)
 
 
 def _cip_sign_in(key, spec):
@@ -576,15 +604,14 @@ def _cip_sign_in(key, spec):
     if not isinstance(key, tuple):
         raise ConnectionNotConfigured('"cip_sign_in" is only for connections configured in CIP')
     tenant_id, name = key
-    state = {"token": spec.auth.access_token, "expires_at": spec.auth.expires_at}
+    state = {"token": spec.auth.access_token, "use_until": _use_until(spec.auth.expires_at, fresh=False)}
     lock = asyncio.Lock()
 
     def usable():
-        return state["token"] and (state["expires_at"] is None
-                                   or time.time() < state["expires_at"] - _REFRESH_MARGIN_SECONDS)
+        return state["token"] and (state["use_until"] is None or time.time() < state["use_until"])
 
     def failed(message):
-        _auth_failures[key] = message
+        _auth_failures[key] = (message, time.monotonic())
         return ToolCallFailed(message)
 
     async def access_token(rejected=None):
@@ -598,7 +625,7 @@ def _cip_sign_in(key, spec):
                     raise failed(f"MCP connection {name!r} isn't signed in: an admin needs to sign in under "
                                  "Settings -> Agent Assist -> Connections") from None
                 raise failed(f"MCP connection {name!r}: couldn't get a current sign-in from ciap-api ({exc})") from None
-            state.update(token=fresh.get("access_token"), expires_at=fresh.get("expires_at"))
+            state.update(token=fresh.get("access_token"), use_until=_use_until(fresh.get("expires_at"), fresh=True))
             if not state["token"]:
                 raise failed(f"MCP connection {name!r} isn't signed in")
             spec._secrets.append(state["token"])
@@ -858,7 +885,7 @@ class _Session:
         except MCPError as exc:
             # A JSON-RPC error from the server: the session itself is fine.
             if not future.done():
-                future.set_exception(ToolCallFailed(str(exc)))
+                future.set_exception(ServerToolError(str(exc)))
             return
         except Exception as exc:
             # Transport trouble: reconnect on the next call.
@@ -892,7 +919,7 @@ async def _submit(name, spec, operation):
 
 
 def _run(name, spec, operation, timeout):
-    _auth_failures.pop(name, None)
+    started = time.monotonic()
     future = asyncio.run_coroutine_threadsafe(_submit(name, spec, operation), _ensure_loop())
     try:
         return future.result(timeout=timeout)
@@ -901,14 +928,16 @@ def _run(name, spec, operation, timeout):
         raise ToolCallFailed(f"MCP connection {_label(name)!r} didn't answer within {timeout:g}s") from None
     except ConnectionNotConfigured:
         raise
+    except ServerToolError:
+        raise
     except ToolCallFailed:
-        reason = _auth_failures.pop(name, None)
+        reason = _auth_failure_since(name, started)
         if reason:
             raise ToolCallFailed(reason) from None
         raise
     except Exception as exc:
         # Transport errors can quote the URL, which may carry a key.
-        reason = _auth_failures.pop(name, None)
+        reason = _auth_failure_since(name, started)
         raise ToolCallFailed(reason or spec.redact(_describe(exc))) from None
 
 
