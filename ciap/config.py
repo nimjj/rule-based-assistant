@@ -178,6 +178,11 @@ RESPONDER_TIMEOUT_SECONDS = float(os.environ.get("RESPONDER_TIMEOUT_SECONDS", "2
 # Override with the env var of the same name.
 RESPONDER_FULL_TIMEOUT_SECONDS = float(os.environ.get("RESPONDER_FULL_TIMEOUT_SECONDS", "40"))
 
+# The longest an LLM escalation (llm.py: ambiguous intent, multi-intent,
+# correction) waits for the model before falling back to its heuristic.
+# Override with the env var of the same name.
+LLM_ESCALATION_TIMEOUT_SECONDS = float(os.environ.get("LLM_ESCALATION_TIMEOUT_SECONDS", "10"))
+
 # The answer mode a turn gets when its request doesn't name one: "focused" or
 # "full" (see responder.MODES).
 # Override with the env var of the same name.
@@ -242,5 +247,4 @@ SLOT_OVERRIDE_ENABLED = _env_flag("SLOT_OVERRIDE_ENABLED")
 # The /demo page (static_demo/) is a dev/sales tool, not part of the product.
 # Off by default: /demo and its assets answer 404. Set the env var of the same
 # name to 1/true to serve it (e.g. on a dev or demo box).
-# DEMO_UI_ENABLED = _env_flag("DEMO_UI_ENABLED")
-DEMO_UI_ENABLED = 1
+DEMO_UI_ENABLED = _env_flag("DEMO_UI_ENABLED")

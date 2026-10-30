@@ -105,7 +105,10 @@ def client(monkeypatch, tmp_path, request):
     monkeypatch.setattr(call_log, "TURN_LOG", tmp_path / "turns.jsonl")
     connections = tmp_path / "connections.json"
     shipped_zoho = json.loads((ROOT / "connections.json").read_text())["zoho"]
-    connections.write_text(json.dumps({"zoho": {**shipped_zoho, "url": "http://zoho.invalid/mcp"}}), encoding="utf-8")
+    connections.write_text(json.dumps({"zoho": {
+        **shipped_zoho, "url": "http://zoho.invalid/mcp",
+        "allowed_tools": ["ZohoCRM_searchRecords", "empty_tool", "slow_tool"],
+    }}), encoding="utf-8")
     monkeypatch.setattr(config, "MCP_CONNECTIONS_PATH", str(connections))
     # Only "zoho" is configured; it connects to the in-process fake.
     monkeypatch.setattr(mcp_client, "_server_for", lambda name, spec: fake_zoho)

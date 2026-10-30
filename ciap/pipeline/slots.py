@@ -69,13 +69,46 @@ _DEAL_NAME_BEFORE_RE = re.compile(rf"({_ORG_NAME})\s+(?i:deal)\b")
 _DEAL_NAME_AFTER_RE = re.compile(rf"\b(?i:{_cued(config.DEAL_NAME_CUE_PHRASES)})\s+(?:(?i:the)\s+)?({_ORG_NAME})")
 
 
+_MONTH_RE = re.compile(
+    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+    r"|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
+    re.IGNORECASE,
+)
+_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+
+
+def _phone_spans(text):
+    """Spans of separated phone numbers ("555-555-5555", "(555) 555 5555"),
+    whose digit groups aren't order numbers. An unseparated digit run is
+    left alone: it may well be an order or account number."""
+    spans = []
+    for match in _PHONE_RE.finditer(text):
+        raw = match.group()
+        digits = sum(c.isdigit() for c in raw)
+        if config.PHONE_MIN_DIGITS <= digits <= config.PHONE_MAX_DIGITS and not raw.strip().isdigit():
+            spans.append(match.span())
+    return spans
+
+
 def extract_order_id(text):
-    """ORD-NNNN if present, otherwise a bare order/account-style number."""
+    """ORD-NNNN if present, otherwise a bare order/account-style number --
+    but not a digit group of a phone number, a date's year ("March 15 2025")
+    or a part of a dashed/slashed date ("2025-03-15")."""
     match = _ORDER_ID_RE.search(text)
     if match:
         return match.group().upper()
-    match = _BARE_NUMBER_RE.search(text)
-    return match.group() if match else None
+    phones = _phone_spans(text)
+    has_month = bool(_MONTH_RE.search(text))
+    for match in _BARE_NUMBER_RE.finditer(text):
+        start, end = match.span()
+        if any(a <= start and end <= b for a, b in phones):
+            continue
+        if (start > 0 and text[start - 1] in "-/.") or text[end:end + 1] in ("-", "/"):
+            continue
+        if has_month and _YEAR_RE.fullmatch(match.group()):
+            continue
+        return match.group()
+    return None
 
 
 def extract_discount_code(text):

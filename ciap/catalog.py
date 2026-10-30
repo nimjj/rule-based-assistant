@@ -122,7 +122,16 @@ def _check_remote(remote, required_slots):
         raise CatalogError(422, "invalid_remote", "remote.connection must be a connection name like \"zoho\".")
     if not isinstance(remote_tool, str) or not remote_tool.strip():
         raise CatalogError(422, "invalid_remote", "remote.tool must be the tool's name on the MCP server.")
+    # An intent binding makes the server call that tool with the connection's
+    # credentials, so only tools a configured connection explicitly allows may
+    # be bound. (A binding to a connection that isn't configured yet can't call
+    # anything; it fails as a tool error until the connection is set up.)
     allowed = mcp_client.allowed_tools(connection)
+    if allowed is None and mcp_client.is_configured(connection):
+        raise CatalogError(
+            422, "invalid_remote",
+            f"Connection {connection!r} has no allowed_tools; list the tools intents may call on it first.",
+        )
     if allowed is not None and remote_tool not in allowed:
         raise CatalogError(
             422, "invalid_remote",
