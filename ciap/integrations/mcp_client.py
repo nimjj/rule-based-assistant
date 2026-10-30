@@ -10,7 +10,8 @@
 #                    (mcp_oauth: once in a browser, scripts/connect.py);
 #                    tokens are refreshed automatically
 #   timeout_seconds  per-call limit
-#   allowed_tools    optional allowlist of remote tools that may be called
+#   allowed_tools    allowlist of remote tools that may be called; intents
+#                    can only be bound to a connection that has one
 #   response         how to unwrap a server's own result envelope
 # The catalog only names a connection and never holds a secret.
 #
@@ -202,6 +203,11 @@ def allowed_tools(name):
     return raw.get("allowed_tools") if isinstance(raw, dict) else None
 
 
+def is_configured(name):
+    """Whether the connection exists in the connections file."""
+    return isinstance(_raw_connections().get(name), dict)
+
+
 def _connection_spec(name):
     connections = _raw_connections()
     if name not in connections:
@@ -237,13 +243,24 @@ def check_connections():
 
 # -- transports and auth ------------------------------------------------------------
 
-def _oauth2(auth):
+# Rotated refresh tokens, per connection and configured token. A session is
+# rebuilt after any transport error; starting it from the configured token
+# again would send one the provider has already revoked (providers that
+# rotate refresh tokens invalidate the old one).
+_rotated_refresh_tokens: dict[tuple, str] = {}
+
+
+def _oauth2(auth, name=None):
     """An httpx Auth that adds an OAuth 2 bearer token, fetching it on first
     use and again when it's about to expire or the server answers 401. A
-    rotated refresh token is kept in memory only."""
+    rotated refresh token is kept in memory only, but outlives the session."""
     import httpx2
 
-    state = {"token": None, "expires_at": 0.0, "refresh_token": auth.refresh_token}
+    rotation_key = (name, auth.token_url, auth.client_id, auth.refresh_token)
+    state = {
+        "token": None, "expires_at": 0.0,
+        "refresh_token": _rotated_refresh_tokens.get(rotation_key, auth.refresh_token),
+    }
     lock = asyncio.Lock()
 
     async def ensure_token(force=False):
@@ -272,6 +289,8 @@ def _oauth2(auth):
             state["token"] = payload["access_token"]
             state["expires_at"] = time.time() + float(payload.get("expires_in", 3600)) - 60
             state["refresh_token"] = payload.get("refresh_token") or state["refresh_token"]
+            if auth.refresh_token and state["refresh_token"] != auth.refresh_token:
+                _rotated_refresh_tokens[rotation_key] = state["refresh_token"]
             return state["token"]
 
     class Flow(httpx2.Auth):
@@ -563,7 +582,7 @@ async def _http_transport(spec, name=None, auth=None):
         if isinstance(spec.auth, BearerAuth):
             headers["Authorization"] = f"Bearer {spec.auth.token}"
         elif isinstance(spec.auth, OAuth2Auth):
-            auth = _oauth2(spec.auth)
+            auth = _oauth2(spec.auth, name=name)
         elif isinstance(spec.auth, McpOAuthAuth):
             auth = _mcp_oauth(name, spec)
     # The SDK's default HTTP timeouts (long reads, for the server's event
@@ -582,8 +601,11 @@ def _server_for(name, spec):
     with an in-process server."""
     if spec.transport == "stdio":
         from mcp import StdioServerParameters
+        from mcp.client.stdio import get_default_environment
 
-        return StdioServerParameters(command=spec.command, args=spec.args, env={**os.environ, **spec.env})
+        # Only a minimal environment (PATH, HOME, ...) plus the connection's own
+        # env: the server process must not see every other connection's secrets.
+        return StdioServerParameters(command=spec.command, args=spec.args, env={**get_default_environment(), **spec.env})
     return _http_transport(spec, name=name)
 
 

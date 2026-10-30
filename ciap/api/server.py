@@ -581,10 +581,14 @@ def _run_turn(
 ) -> dict:
     """Process one turn under the call's lock. Caller holds no lock."""
     with session.lock:
+        if _calls.get(key) is not session:
+            # Deleted, reset or expired while this turn waited for the lock:
+            # applying it to the dropped session would lose it silently.
+            raise ApiError(409, "call_replaced", f"Call {key[1]!r} was deleted or reset while this turn waited; resend it.")
         try:
             trace = session.store.process_utterance(text, speaker=speaker, answer_mode=answer_mode)
         except Exception as exc:
-            logger.exception("%s process_utterance failed on %r", _who(key, user_id), text)
+            logger.exception("%s process_utterance failed (%d chars)", _who(key, user_id), len(text))
             call_log.log_event(
                 "turn_error", **_ids(key, user_id), utterance=text, error=f"{type(exc).__name__}: {exc}"
             )
@@ -593,11 +597,13 @@ def _run_turn(
         session.touch()
         view = views.build_turn_view(trace, session.store, session.turn_count)
 
+    # The plain-text log carries no caller speech or tool arguments (emails,
+    # phone numbers); the full turn is in the call log (call_log.py).
     fired = view["mcp"]["fired_this_turn"]
-    tools = ", ".join(f"{c['tool']}({c['arguments']})" for c in fired)
+    tools = ", ".join(c["tool"] for c in fired)
     logger.info(
-        "%s turn=%d %r -> %s/%s intent=%s%s",
-        _who(key, user_id), view["turn_index"], text,
+        "%s turn=%d (%d chars) -> %s/%s intent=%s%s",
+        _who(key, user_id), view["turn_index"], len(text),
         view["intent"]["decision"], view["intent"]["turn_type"], view["intent"]["selected_intent"],
         f" | MCP: {tools}" if fired else "",
     )
@@ -714,8 +720,10 @@ def delete_call(tenant_id: str, call_id: str):
     """Drop a call's state. Optional: calls idle for the configured timeout are
     dropped automatically."""
     key = (tenant_id, call_id)
-    _get_session(key, touch=False)
-    _calls.pop(key, None)
+    session = _get_session(key, touch=False)
+    with session.lock:  # let a turn in flight finish first
+        if _calls.get(key) is session:
+            del _calls[key]
     logger.info("%s deleted", _who(key))
     call_log.log_event("call_deleted", **_ids(key))
 
@@ -724,8 +732,10 @@ def delete_call(tenant_id: str, call_id: str):
 def reset_call(tenant_id: str, call_id: str):
     """Wipe a call's frames and turn counter but keep the same IDs."""
     key = (tenant_id, call_id)
-    _get_session(key)
-    _calls[key] = CallSession()
+    session = _get_session(key)
+    with session.lock:  # let a turn in flight finish first
+        if _calls.get(key) is session:
+            _calls[key] = CallSession()
     logger.info("%s reset", _who(key))
     call_log.log_event("call_reset", **_ids(key))
     return NewCallResponse(tenant_id=tenant_id, call_id=call_id)

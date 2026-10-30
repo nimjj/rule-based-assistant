@@ -288,9 +288,9 @@ class ConversationStateStore:
             return self._open_new_intent(chosen_intent, utterance, speaker, trace, "new_intent_escalated")
 
         # Low confidence but looks like a correction/reference to something
-        # already in play -> revert the most recent frame.
-        if (correction_flag or reference_flag) and self.frames:
-            last = self._last_frame()
+        # already in play -> revert the most recent frame still in play.
+        last = next((f for f in reversed(self.frames) if f.status != "REVERTED"), None)
+        if (correction_flag or reference_flag) and last:
             llm_result = llm.escalate(
                 "correction_or_reference", utterance,
                 context={"last_frame": last.id, "intent": last.intent},

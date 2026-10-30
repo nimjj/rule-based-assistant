@@ -20,11 +20,14 @@ import json
 
 import ollama
 
+from ciap import config
 from ciap.pipeline.intents import INTENTS
 
 MODEL_NAME = "gemma3:1b"
 
-_client = ollama.Client()
+# Escalations run while the call's lock is held, so a stalled model must not
+# hold the call (or a rename waiting on every call's lock) forever.
+_client = ollama.Client(timeout=config.LLM_ESCALATION_TIMEOUT_SECONDS)
 
 
 def _intent_brief(intent_name, n_exemplars=3):
@@ -34,7 +37,8 @@ def _intent_brief(intent_name, n_exemplars=3):
 
 def _ask(prompt):
     """Call the model, expecting a single JSON object back. Returns the
-    parsed dict, or {} if the call failed or didn't return valid JSON."""
+    parsed dict, or {"_error": ...} if the call failed or didn't return a
+    JSON object."""
     try:
         response = _client.chat(
             model=MODEL_NAME,
@@ -42,9 +46,12 @@ def _ask(prompt):
             format="json",
             options={"temperature": 0},
         )
-        return json.loads(response["message"]["content"])
+        result = json.loads(response["message"]["content"])
     except Exception as exc:
         return {"_error": str(exc)}
+    if not isinstance(result, dict):
+        return {"_error": f"expected a JSON object, got {type(result).__name__}"}
+    return result
 
 
 # -- one handler per escalation reason ---------------------------------------
@@ -91,6 +98,8 @@ def _resolve_multi_intent(utterance, two_intents, fallback_intent):
     )
     result = _ask(prompt)
     resolved = result.get("resolved_intents")
+    if isinstance(resolved, list):
+        resolved = list(dict.fromkeys(resolved))  # ["a", "a"] is one intent, not two
     valid = (
         isinstance(resolved, list)
         and 1 <= len(resolved) <= 2
@@ -125,8 +134,10 @@ def _resolve_correction(reason, utterance, ref_context, fallback_intent):
     result = _ask(prompt)
     is_correction = result.get("is_correction_or_reference")
     if not isinstance(is_correction, bool):
-        is_correction = True
-        result["reasoning"] = result.get("reasoning") or "model call failed or returned no verdict; defaulted to treating it as a correction"
+        # Reverting a frame (possibly one whose tool already ran) on no verdict
+        # does more harm than leaving the turn unresolved.
+        is_correction = False
+        result["reasoning"] = result.get("reasoning") or "model call failed or returned no verdict; not treated as a correction"
     return {
         "escalated": True,
         "reason": reason,
