@@ -7,6 +7,7 @@
 #   - corrections
 #   - interruptions
 #   - conditional requests
+#   - free-text (TEXT) slots no pattern can read, e.g. a customer's name
 #
 # Everything else stays deterministic (embeddings + regex + state machine)
 # because it's cheaper and more reliable. This module used to be a stub
@@ -20,8 +21,8 @@ import json
 
 import ollama
 
+from ciap import catalog
 from ciap import config
-from ciap.pipeline.intents import INTENTS
 
 MODEL_NAME = "gemma3:1b"
 
@@ -31,7 +32,7 @@ _client = ollama.Client(timeout=config.LLM_ESCALATION_TIMEOUT_SECONDS)
 
 
 def _intent_brief(intent_name, n_exemplars=3):
-    exemplars = INTENTS[intent_name]["exemplars"][:n_exemplars]
+    exemplars = catalog.intents().get(intent_name, {}).get("exemplars", [])[:n_exemplars]
     return f"- {intent_name}: " + "; ".join(f'"{e}"' for e in exemplars)
 
 
@@ -172,3 +173,27 @@ def escalate(reason, utterance, context=None, fallback_intent=None):
         "resolved_intent": fallback_intent,
         "note": "no handler for this escalation reason; no model call made",
     }
+
+
+def extract_text_slot(utterance, name, spec):
+    """Read a free-text slot (TEXT, no pattern) from one turn, e.g. the
+    caller's name or the product they mean, or None when the turn doesn't say
+    it. Only asked for the slot a frame is waiting on, so at most one model
+    call per turn."""
+    spec = spec or {}
+    about = "; ".join(x for x in (spec.get("label"), spec.get("description")) if x) or name.replace("_", " ")
+    asked = f'The agent asked: "{spec["prompt"]}"\n' if spec.get("prompt") else ""
+    prompt = (
+        "Extract one piece of information from a line said on a customer support call.\n\n"
+        f"Information wanted: {about}\n{asked}"
+        f'Line: "{utterance}"\n\n'
+        "Copy the value exactly as said. If the line doesn't contain it, use null. "
+        'Respond with a JSON object: {"value": "<the value>" or null}.'
+    )
+    value = _ask(prompt).get("value")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    # Only what was actually said: a model that paraphrases or invents doesn't fill the slot.
+    return value if value.lower() in utterance.lower() else None
+

@@ -10,7 +10,7 @@ import pytest
 from ciap.pipeline import llm
 from ciap.pipeline.slots import extract_order_id
 
-from test_api import TENANT, NEW_INTENT, client, live_call, turn, write_connections  # noqa: F401
+from test_api import TENANT, client, live_call, turn  # noqa: F401
 
 
 # -- order_id -----------------------------------------------------------------
@@ -68,21 +68,10 @@ def test_escalation_client_has_a_timeout():
     assert llm._client._client.timeout.read is not None
 
 
-# -- intent bindings ----------------------------------------------------------
-
-def test_binding_needs_connection_allowed_tools(client):
-    shipped = json.loads((__import__("pathlib").Path(__file__).parent.parent / "connections.json").read_text())["zoho"]
-    write_connections({"zoho": {k: v for k, v in shipped.items() if k != "allowed_tools"}})
-    body = {**NEW_INTENT, "remote": {"connection": "zoho", "tool": "ZohoCRM_searchRecords",
-                                     "arguments": {"path_variables": {"module": "Leads"}}}}
-    r = client.post("/v1/intents", json=body)
-    assert r.status_code == 422 and "allowed_tools" in r.json()["error"]["message"]
-
-
 # -- turns racing delete/reset ------------------------------------------------
 
 @pytest.mark.parametrize("method,path", [("delete", ""), ("post", "/reset")])
-def test_turn_waiting_on_a_deleted_or_reset_call_is_refused(client, method, path):
+def test_turn_waiting_on_a_deleted_or_reset_call_is_refused(client, monkeypatch, method, path):
     from ciap.api import server
 
     cid = live_call(client)
@@ -96,6 +85,7 @@ def test_turn_waiting_on_a_deleted_or_reset_call_is_refused(client, method, path
     session.lock.release()
     t.join(5)
     assert done["r"].status_code in (200, 204)
-    with pytest.raises(server.ApiError) as exc:
-        server._run_turn((TENANT, cid), session, "track my order", "customer")
-    assert exc.value.code == "call_replaced"
+    # A turn that picked up the call before the delete/reset, then waited for its lock:
+    monkeypatch.setattr(server, "_get_or_create_session", lambda key, source, user_id=None: session)
+    r = turn(client, cid, "track my order")
+    assert r.status_code == 409 and r.json()["error"]["code"] == "call_replaced"

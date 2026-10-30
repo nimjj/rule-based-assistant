@@ -191,3 +191,112 @@ SLOT_EXTRACTORS = {
     "company_name": extract_company_name,
     "deal_name": extract_deal_name,
 }
+
+
+# -- by CIP slot type ----------------------------------------------------------
+#
+# A tenant's slots (catalog.py) have a type rather than a fixed name. A slot
+# named like one above uses that extractor (order_id, email, ...); any other
+# goes by its type. TEXT slots without a named extractor can't be read with a
+# pattern: state_store asks the LLM for the one a frame is waiting on.
+
+_TIME_RE = re.compile(
+    r"\b(?:(?P<h12>1[0-2]|0?[1-9])(?::(?P<m12>[0-5]\d))?\s*(?P<ampm>[ap])\.?\s?m\b\.?"
+    r"|(?P<h24>[01]?\d|2[0-3]):(?P<m24>[0-5]\d)\b"
+    r"|(?P<word>noon|midnight))",
+    re.IGNORECASE,
+)
+
+
+def extract_time(text):
+    """A time of day as "HH:MM" ("3pm" -> "15:00", "10:30 a.m." -> "10:30",
+    "14:45", "noon")."""
+    match = _TIME_RE.search(text)
+    if not match:
+        return None
+    if match.group("word"):
+        return "12:00" if match.group("word").lower() == "noon" else "00:00"
+    if match.group("h24") is not None:
+        return f"{int(match.group('h24')):02d}:{match.group('m24')}"
+    hour = int(match.group("h12")) % 12 + (12 if match.group("ampm").lower() == "p" else 0)
+    return f"{hour:02d}:{match.group('m12') or '00'}"
+
+
+_NUMBER_RE = re.compile(r"(?<![\w.])-?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\w])|(?<![\w.])-?\d+(?:\.\d+)?(?![\w])")
+
+
+def extract_number(text):
+    """The first number said that isn't part of a phone number ("2", "1,250",
+    "3.5"), without thousands separators."""
+    phones = _phone_spans(text)
+    for match in _NUMBER_RE.finditer(text):
+        start, end = match.span()
+        if any(a <= start and end <= b for a, b in phones):
+            continue
+        return match.group().replace(",", "")
+    return None
+
+
+_CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP", "₹": "INR"}
+_CURRENCY_WORDS = {
+    "dollar": "USD", "dollars": "USD", "usd": "USD", "bucks": "USD", "euro": "EUR", "euros": "EUR", "eur": "EUR",
+    "pound": "GBP", "pounds": "GBP", "gbp": "GBP", "rupee": "INR", "rupees": "INR", "inr": "INR",
+}
+_AMOUNT = r"\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?"
+_CURRENCY_BEFORE_RE = re.compile(rf"(?P<sym>[$€£₹])\s?(?P<amt>{_AMOUNT})")
+_CURRENCY_AFTER_RE = re.compile(
+    rf"(?P<amt>{_AMOUNT})\s?(?P<word>" + "|".join(sorted(_CURRENCY_WORDS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def extract_currency(text):
+    """An amount of money as "<amount> <ISO code>" ("$12.50" -> "12.50 USD",
+    "40 euros" -> "40 EUR")."""
+    match = _CURRENCY_BEFORE_RE.search(text)
+    if match:
+        return f"{match.group('amt').replace(',', '')} {_CURRENCY_SYMBOLS[match.group('sym')]}"
+    match = _CURRENCY_AFTER_RE.search(text)
+    if match:
+        return f"{match.group('amt').replace(',', '')} {_CURRENCY_WORDS[match.group('word').lower()]}"
+    return None
+
+
+def extract_option(text, options):
+    """The slot's option mentioned in the turn, as the option is written. The
+    longest match wins ("Express Plus" over "Express")."""
+    lowered = text.lower()
+    for option in sorted((o for o in options if o and o.strip()), key=len, reverse=True):
+        if re.search(rf"(?<!\w){re.escape(option.strip().lower())}(?!\w)", lowered):
+            return option
+    return None
+
+
+TYPE_EXTRACTORS = {
+    "EMAIL": extract_email,
+    "PHONE": extract_phone,
+    "DATE": extract_date,
+    "TIME": extract_time,
+    "NUMBER": extract_number,
+    "CURRENCY": extract_currency,
+}
+
+
+def extract(name, spec, text):
+    """A slot's value from one turn, or None. `spec` is the catalog's slot
+    ({"type", "options", ...}). A TEXT slot with no named extractor is None
+    here (see above)."""
+    named = SLOT_EXTRACTORS.get(name)
+    if named:
+        return named(text)
+    slot_type = ((spec or {}).get("type") or "TEXT").upper()
+    if slot_type == "OPTION":
+        return extract_option(text, (spec or {}).get("options") or [])
+    extractor = TYPE_EXTRACTORS.get(slot_type)
+    return extractor(text) if extractor else None
+
+
+def has_pattern(name, spec):
+    """Whether extract() can read this slot without the LLM."""
+    return name in SLOT_EXTRACTORS or ((spec or {}).get("type") or "TEXT").upper() != "TEXT"
+
