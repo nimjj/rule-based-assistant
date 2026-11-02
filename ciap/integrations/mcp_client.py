@@ -49,14 +49,12 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import parse_qs, urlparse
 
-from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 
 from ciap import catalog
 from ciap import ciap_api
 from ciap import config
 
-load_dotenv(Path(config.ROOT_DIR) / ".env")
 
 logger = logging.getLogger("ciap.mcp")
 
