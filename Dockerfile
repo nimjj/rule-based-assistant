@@ -20,17 +20,22 @@ RUN pip install --no-cache-dir torch==$(grep -E '^torch==' requirements.txt | cu
         --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
 
+# Runs as uid 10001 by default; any uid works with group 0 (docker run --user <uid>:0), e.g. the host user
+# that owns the mounted logs/ and data/ folders. What the service writes (logs/, data/, the model cache) is
+# owned by app and group 0, writable by both.
 RUN useradd --system --uid 10001 --home-dir /app app \
-    && mkdir -p /app/logs /app/data /app/.hf \
-    && chown app:app /app/logs /app/data /app/.hf
+    && mkdir -p /app/logs /app/data \
+    && chown app:0 /app/logs /app/data && chmod g=u /app/logs /app/data
+
+# Bake the embedding model in, so the container never needs the internet to start. The ownership change is in
+# the same step, so the model isn't stored twice.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" \
+    && chown -R app:0 /app/.hf && chmod -R g=u /app/.hf
 USER 10001
 
-# Bake the embedding model in (as the app user, so there is no chown layer copying it), so the container never
-# needs the internet to start.
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
-
-COPY --chown=10001:10001 ciap ./ciap
-COPY --chown=10001:10001 connections.json ./connections.json
+# Code stays owned by root (read-only to the service user).
+COPY ciap ./ciap
+COPY connections.json ./connections.json
 
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
