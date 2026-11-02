@@ -4,9 +4,15 @@
 
 import os
 
+from dotenv import load_dotenv
+
 # The repository root: runtime files (data/, logs/, .env, connections.json)
 # live here, outside the ciap package.
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Settings below read the environment when this module is imported, so .env (see .env.example) is loaded
+# first. Real environment variables win over .env.
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
 
 # Sentence embedding model used for intent retrieval (embeddings.py). Small
 # and CPU-friendly; swap this to retune retrieval quality/speed without
