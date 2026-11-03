@@ -221,6 +221,13 @@ MCP_SESSION_IDLE_SECONDS = float(os.environ.get("MCP_SESSION_IDLE_SECONDS", "600
 # Override with the env var of the same name.
 RESPONDER_MODEL_NAME = os.environ.get("RESPONDER_MODEL_NAME", "gemma4:e2b-it-qat")
 
+# The model llm.py asks for escalations (ambiguous intent, multi-intent,
+# corrections, free-text slots). Unset: the answer model above, so one model
+# serves both and Ollama keeps only that one loaded. Set it to use a separate
+# (e.g. smaller) model for escalations.
+# Override with the env var of the same name.
+LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "").strip() or RESPONDER_MODEL_NAME
+
 # The longest a turn waits for that answer before falling back to a plain
 # listing of the result. On top of the tool call's own wait. 20s covers a
 # full Zoho lead record (~900 prompt tokens, ~14s) on a CPU-only box; on a

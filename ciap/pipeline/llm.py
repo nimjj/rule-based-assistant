@@ -12,8 +12,9 @@
 # Everything else stays deterministic (embeddings + regex + state machine)
 # because it's cheaper and more reliable. This module used to be a stub
 # (llm_stub.py) that recorded an escalation and returned a best-effort
-# fallback without calling a model. It now calls a real local model --
-# Gemma 3 1B, served by Ollama -- for the reasons above, and falls back to
+# fallback without calling a model. It now calls a real local model served by
+# Ollama -- by default the same one responder.py answers with
+# (config.LLM_MODEL_NAME) -- for the reasons above, and falls back to
 # the same heuristic behavior only if the call fails or returns something
 # unusable, so the rest of the pipeline keeps working either way.
 
@@ -24,11 +25,30 @@ import ollama
 from ciap import catalog
 from ciap import config
 
-MODEL_NAME = "gemma3:1b"
+MODEL_NAME = config.LLM_MODEL_NAME
 
 # Escalations run while the call's lock is held, so a stalled model must not
 # hold the call (or a rename waiting on every call's lock) forever.
 _client = ollama.Client(timeout=config.LLM_ESCALATION_TIMEOUT_SECONDS)
+
+
+def _shares_answer_model():
+    return MODEL_NAME == config.RESPONDER_MODEL_NAME
+
+
+def _shared_model_options():
+    # Sharing the answer model: the same num_ctx as responder.py on every
+    # call, or Ollama reloads the model each time the two kinds of call
+    # alternate.
+    if _shares_answer_model() and config.RESPONDER_NUM_CTX:
+        return {"num_ctx": config.RESPONDER_NUM_CTX}
+    return {}
+
+
+def _shared_keep_alive():
+    # ...and the same keep_alive, or an escalation resets the answer model's
+    # "loaded for good" to Ollama's 5-minute default.
+    return {"keep_alive": config.RESPONDER_KEEP_ALIVE_SECONDS} if _shares_answer_model() else {}
 
 
 def _intent_brief(intent_name, n_exemplars=3):
@@ -45,7 +65,11 @@ def _ask(prompt):
             model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             format="json",
-            options={"temperature": 0},
+            options={"temperature": 0, **_shared_model_options()},
+            # Models that can reason first (Gemma 4) do by default; a pick from
+            # a short list doesn't need it, and it would cost seconds per turn.
+            think=False,
+            **_shared_keep_alive(),
         )
         result = json.loads(response["message"]["content"])
     except Exception as exc:
