@@ -4,7 +4,7 @@
 # place that decides what a turn looks like to a consumer. Pure functions, no
 # I/O and no FastAPI, so they're testable without a server.
 
-from ciap.pipeline.intents import INTENTS
+from ciap import catalog
 
 # turn_type (from state_store.process_utterance) -> a short decision label.
 # Coarser than turn_type, meant for badges / at-a-glance summaries.
@@ -34,7 +34,7 @@ def humanize(name):
 def intent_label(name):
     if name is None:
         return None
-    return INTENTS.get(name, {}).get("label") or humanize(name)
+    return catalog.intents().get(name, {}).get("label") or humanize(name)
 
 
 def tool_call_view(tool_call):
@@ -73,7 +73,7 @@ def frame_view(frame, filled_this_turn=()):
         "intent_label": intent_label(frame.intent),
         "status": frame.status,
         "initiated_by": frame.initiated_by,
-        "required": INTENTS.get(frame.intent, {}).get("required_slots", []),
+        "required": catalog.intents().get(frame.intent, {}).get("required_slots", []),
         "slots": {k: slot_display(v) for k, v in frame.slots.items()},
         "missing": list(frame.missing_slots),
         "filled_this_turn": list(filled_this_turn),

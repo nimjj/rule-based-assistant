@@ -9,7 +9,27 @@
       "success_values": ["success"],
       "error_values": ["failure", "error"],
       "empty_message_pattern": "Empty response received from API.*Status - 204"
-    }
+    },
+    "allowed_tools": ["ZohoCRM_searchRecords"]
+  },
+
+  "zoho_oauth": {
+    "url": "${ZOHO_OAUTH_MCP_URL}",
+    "auth": {
+      "type": "mcp_oauth",
+      "client_id": "${ZOHO_OAUTH_CLIENT_ID}",
+      "client_secret": "${ZOHO_OAUTH_CLIENT_SECRET}"
+    },
+    "timeout_seconds": 10,
+    "response": {
+      "status_field": "status",
+      "data_field": "data",
+      "message_field": "message",
+      "success_values": ["success"],
+      "error_values": ["failure", "error"],
+      "empty_message_pattern": "Empty response received from API.*Status - 204"
+    },
+    "allowed_tools": ["ZohoCRM_searchRecords"]
   },
 
   "hubspot": {

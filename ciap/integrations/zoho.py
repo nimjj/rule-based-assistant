@@ -1,9 +1,9 @@
 # Remote bindings for the shipped Zoho CRM intents (see intents.py). They all
 # run the ZohoCRM_searchRecords tool on a Zoho-hosted MCP server (set up in
 # Zoho's MCP console, with that tool enabled). For another server, check its
-# tools with GET /v1/connections/{name}/tools and change an intent's binding
-# with PUT /v1/intents/{name}. The binding format is described above
-# mcp_tools.remote_calls.
+# tools with GET /v1/connections/{name}/tools and change the intent's binding
+# in intents.py (built-in catalog only; per-tenant MCP bindings are to be
+# managed in CIP). The binding format is described above mcp_tools.remote_calls.
 
 
 def _search(module, query_params, fields, fallback=None):

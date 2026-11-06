@@ -4,9 +4,15 @@
 
 import os
 
+from dotenv import load_dotenv
+
 # The repository root: runtime files (data/, logs/, .env, connections.json)
 # live here, outside the ciap package.
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Settings below read the environment when this module is imported, so .env (see .env.example) is loaded
+# first. Real environment variables win over .env.
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
 
 # Sentence embedding model used for intent retrieval (embeddings.py). Small
 # and CPU-friendly; swap this to retune retrieval quality/speed without
@@ -119,12 +125,41 @@ NAME_JOIN_WORDS = ["and", "&", "of", "the"]
 # Longest run of words captured as a single company or deal name.
 ORG_NAME_MAX_WORDS = 6
 
-# -- catalog.py: admin-edited intent catalog ----------------------------------
+# -- catalog.py / ciap_api.py: where intents and call state come from ---------
 
-# Where edits made through the /v1/intents write endpoints are saved. Loaded
-# over the defaults in intents.py at startup when present; delete it to go
-# back to those defaults.
-CATALOG_PATH = os.path.join(ROOT_DIR, "data", "catalog.json")
+# ciap-api's base URL (e.g. https://ciap.snet.internal). When set, the service
+# runs in CIP mode: each tenant's intents, phrases and slots come from ciap-api
+# (GET /api/internal/assist/tenants/{tenant}/catalog) and each call's state is
+# loaded from and saved back to it before and after every turn, so the service
+# keeps nothing between turns and any number of instances can serve a call.
+# Unset: the built-in catalog (intents.py) for every tenant and call state in
+# this process's memory -- local development, the demo and the tests only.
+# Override with the env var of the same name.
+CIAP_API_BASE_URL = os.environ.get("CIAP_API_BASE_URL", "").strip().rstrip("/")
+
+# Sent to ciap-api as X-Api-Key: ciap-api's AGENT_ASSIST_INTERNAL_API_KEY, the
+# key only this service holds (not the ingestion key). ciap-api refuses these
+# requests while it's unset there.
+# Override with the env var of the same name.
+CIAP_API_KEY = os.environ.get("CIAP_API_KEY", "").strip()
+
+# The longest one request to ciap-api (catalog, load or save state) waits.
+# Override with the env var of the same name.
+CIAP_API_TIMEOUT_SECONDS = float(os.environ.get("CIAP_API_TIMEOUT_SECONDS", "5"))
+
+# A tenant's catalog is reloaded at once when a turn carries a newer
+# catalog_version (ciap-api bumps it on every save). This is the backstop for
+# turns sent without one: the longest a cached catalog is used before it is
+# reloaded anyway.
+# Override with the env var of the same name.
+CATALOG_MAX_AGE_SECONDS = float(os.environ.get("CATALOG_MAX_AGE_SECONDS", "300"))
+
+# -- server.py: inbound auth -----------------------------------------------------
+
+# When set, every /v1 request must send it as X-Api-Key (ciap-kafka sends its
+# agent-assist.api.key). Unset: open, for local development only.
+# Override with the env var of the same name.
+API_KEY = os.environ.get("AGENT_ASSIST_API_KEY", "").strip()
 
 # -- mcp_client.py: remote MCP servers for live tools -------------------------
 
@@ -156,6 +191,26 @@ MCP_TOKENS_DIR = os.environ.get("MCP_TOKENS_DIR", os.path.join(ROOT_DIR, "data",
 # Override with the env var of the same name.
 MCP_CALL_TIMEOUT_SECONDS = float(os.environ.get("MCP_CALL_TIMEOUT_SECONDS", "5"))
 
+# CIP mode: tenants' MCP connections must be https and resolve to public
+# addresses. 1/true lifts that, for local development against MCP servers on
+# this machine or network only.
+# Override with the env var of the same name.
+MCP_ALLOW_PRIVATE_HOSTS = os.environ.get("MCP_ALLOW_PRIVATE_HOSTS", "").strip().lower() in ("1", "true", "yes", "on")
+
+# CIP mode: a turn that calls a tool claims it first (saved with the call's
+# state), so another copy of the same turn can't call the tool too. That copy
+# waits up to TURN_IN_PROGRESS_WAIT_SECONDS for the first to finish and returns
+# its response; a claim older than TURN_CLAIM_STALE_SECONDS is treated as
+# abandoned (the instance holding it died).
+# Override with the env vars of the same names.
+TURN_IN_PROGRESS_WAIT_SECONDS = float(os.environ.get("TURN_IN_PROGRESS_WAIT_SECONDS", "30"))
+TURN_CLAIM_STALE_SECONDS = float(os.environ.get("TURN_CLAIM_STALE_SECONDS", "120"))
+
+# A tenant's MCP session left unused this long is closed (its socket and the
+# secrets it holds go with it); the next call opens a new one.
+# Override with the env var of the same name.
+MCP_SESSION_IDLE_SECONDS = float(os.environ.get("MCP_SESSION_IDLE_SECONDS", "600"))
+
 # -- responder.py: agent-facing answers for live tool results -----------------
 
 # The Ollama model that turns a live tool's JSON result into a short briefing
@@ -165,6 +220,13 @@ MCP_CALL_TIMEOUT_SECONDS = float(os.environ.get("MCP_CALL_TIMEOUT_SECONDS", "5")
 # for this, with thinking off (see responder._ask_model).
 # Override with the env var of the same name.
 RESPONDER_MODEL_NAME = os.environ.get("RESPONDER_MODEL_NAME", "gemma4:e2b-it-qat")
+
+# The model llm.py asks for escalations (ambiguous intent, multi-intent,
+# corrections, free-text slots). Unset: the answer model above, so one model
+# serves both and Ollama keeps only that one loaded. Set it to use a separate
+# (e.g. smaller) model for escalations.
+# Override with the env var of the same name.
+LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "").strip() or RESPONDER_MODEL_NAME
 
 # The longest a turn waits for that answer before falling back to a plain
 # listing of the result. On top of the tool call's own wait. 20s covers a
@@ -177,6 +239,11 @@ RESPONDER_TIMEOUT_SECONDS = float(os.environ.get("RESPONDER_TIMEOUT_SECONDS", "2
 # the result and writes a paragraph rather than a sentence or two.
 # Override with the env var of the same name.
 RESPONDER_FULL_TIMEOUT_SECONDS = float(os.environ.get("RESPONDER_FULL_TIMEOUT_SECONDS", "40"))
+
+# The longest an LLM escalation (llm.py: ambiguous intent, multi-intent,
+# correction) waits for the model before falling back to its heuristic.
+# Override with the env var of the same name.
+LLM_ESCALATION_TIMEOUT_SECONDS = float(os.environ.get("LLM_ESCALATION_TIMEOUT_SECONDS", "10"))
 
 # The answer mode a turn gets when its request doesn't name one: "focused" or
 # "full" (see responder.MODES).
@@ -215,8 +282,9 @@ RESPONDER_NUM_CTX = int(os.environ.get("RESPONDER_NUM_CTX") or (0 if RESPONDER_P
 
 # -- server.py: call memory ----------------------------------------------------
 
-# A call with no activity (turn, transcript, slot override, reset) for this
-# many seconds is dropped from memory; reads of it then get 404
+# Built-in mode only (in CIP mode ciap-api keeps each call's state). A call
+# with no activity (turn, transcript, slot override, reset) for this many
+# seconds is dropped from memory; reads of it then get 404
 # `call_expired`, and a new turn starts it over empty. Reading state
 # (GET /v1/tenants/{tenant_id}/calls/{call_id}) doesn't count as activity.
 # 30 min leaves room for long holds; PBXware's hangup should still DELETE the
@@ -242,5 +310,4 @@ SLOT_OVERRIDE_ENABLED = _env_flag("SLOT_OVERRIDE_ENABLED")
 # The /demo page (static_demo/) is a dev/sales tool, not part of the product.
 # Off by default: /demo and its assets answer 404. Set the env var of the same
 # name to 1/true to serve it (e.g. on a dev or demo box).
-# DEMO_UI_ENABLED = _env_flag("DEMO_UI_ENABLED")
-DEMO_UI_ENABLED = 1
+DEMO_UI_ENABLED = _env_flag("DEMO_UI_ENABLED")

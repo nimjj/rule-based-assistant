@@ -23,9 +23,9 @@ import re
 
 import ollama
 
+from ciap import catalog
 from ciap import config
 from ciap.pipeline import embeddings
-from ciap.pipeline.intents import INTENTS
 
 MODEL_NAME = config.RESPONDER_MODEL_NAME
 
@@ -76,11 +76,11 @@ INSTRUCTIONS = {
 
 # A tool call is named after the intent that fired it.
 def _tool_label(name):
-    return INTENTS.get(name, {}).get("label") or name.replace("_", " ").title()
+    return catalog.intents().get(name, {}).get("label") or name.replace("_", " ").title()
 
 
 def _tool_line(name):
-    description = INTENTS.get(name, {}).get("description")
+    description = catalog.intents().get(name, {}).get("description")
     return f"{_tool_label(name)} -- {description}" if description else _tool_label(name)
 
 

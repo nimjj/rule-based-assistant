@@ -1,10 +1,16 @@
 # HTTP API around the intent pipeline (embedding retrieval, regex/library slot
 # extraction, frame-based dialogue state, Gemma 3 1B LLM escalation).
 #
-# The pipeline is stateful within one call (frames persist turn to turn), so
-# this isn't a single stateless endpoint: the first turn for a new
-# (tenant ID, PBXware call ID) pair starts a call, then every turn for that
-# call is fed into the same ConversationStateStore.
+# The pipeline is stateful within one call (frames persist turn to turn): the
+# first turn for a new (tenant ID, PBXware call ID) pair starts a call, then
+# every turn for that call continues the same ConversationStateStore.
+#
+# CIP mode (config.CIAP_API_BASE_URL set, how CIP runs it): the process keeps
+# nothing between turns. Each turn loads the call's state from ciap-api, runs
+# against the tenant's own catalog (catalog.py) and saves the state back, so
+# any number of instances can serve a call. Otherwise (local development, the
+# demo, the tests) calls live in this process's memory and every tenant gets
+# the built-in catalog.
 #
 # All response shaping lives in views.py; all pipeline logic in state_store.py.
 # This module is only routing, validation, session bookkeeping and errors.
@@ -12,15 +18,14 @@
 # Run:  uvicorn ciap.api.server:app
 # Docs: http://127.0.0.1:8000/docs   (OpenAPI JSON: /openapi.json)
 #
-# Not production-ready as shipped -- no auth, in-memory sessions (idle calls
-# expire after config.CALL_IDLE_TIMEOUT_SECONDS).
-# See API_DOCUMENTATION.md "Production handover items".
+# /v1 requires X-Api-Key when config.API_KEY (AGENT_ASSIST_API_KEY) is set.
 
 import asyncio
+import hmac
 import threading
 import time
 from collections import OrderedDict
-from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Path, Query, Request
@@ -31,12 +36,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ciap import call_log
 from ciap import catalog
+from ciap import ciap_api
 from ciap import config
 from ciap.integrations import mcp_client
+from ciap.integrations import mcp_tools
 from ciap.api import views
 from ciap.api.demo_web import router as demo_router
-from ciap.pipeline.intents import INTENTS
-from ciap.integrations.mcp_tools import executes_live
 from ciap.pipeline.slots import SLOT_EXTRACTORS
 from ciap.pipeline.state_store import ConversationStateStore
 from ciap.pipeline.transcripts import parse_turns
@@ -78,14 +83,19 @@ async def lifespan(app: FastAPI):
     # escalation LLM is still lazy -- warm it with one escalating turn if the
     # first live one needs to be fast.) The responder model is warmed too:
     # its answers have a timeout a cold load would always blow.
-    if catalog.load():
-        logger.info("catalog loaded from %s", config.CATALOG_PATH)
+    logger.info(
+        "catalogs and call state: %s",
+        f"ciap-api {config.CIAP_API_BASE_URL}" if ciap_api.enabled() else "built-in catalog, in-memory calls",
+    )
+    if not config.API_KEY:
+        logger.warning("AGENT_ASSIST_API_KEY is not set: /v1 is open (local development only)")
     warm_embeddings()
     warm_responder()
     _check_connections()
     sweeper = asyncio.create_task(_sweep_idle_calls_forever())
     yield
     mcp_client.shutdown()
+    ciap_api.close()
     sweeper.cancel()
     with suppress(asyncio.CancelledError):
         await sweeper
@@ -171,6 +181,15 @@ _ANSWER_MODE_FIELD = Field(
 )
 
 
+_CATALOG_VERSION_FIELD = Field(
+    default=None, ge=0,
+    description=(
+        "The tenant's catalog version when CIP queued the turn. CIP mode: a newer version than the "
+        "cached catalog reloads it before the turn runs. Ignored otherwise."
+    ),
+)
+
+
 class NewCallResponse(BaseModel):
     tenant_id: str = Field(..., examples=["acme"])
     call_id: str = Field(..., examples=["1727690000.12345"])
@@ -188,6 +207,14 @@ class TurnRequest(BaseModel):
     )
     user_id: UserId | None = _USER_ID_FIELD
     answer_mode: AnswerMode | None = _ANSWER_MODE_FIELD
+    catalog_version: int | None = _CATALOG_VERSION_FIELD
+    turn_id: int | None = Field(
+        default=None, ge=1,
+        description=(
+            "The turn's id in CIP. A turn whose id the call has already applied isn't run again (no second "
+            "tool call): the response it got the first time is returned. CIP sends it; optional otherwise."
+        ),
+    )
 
 
 class TranscriptTurn(BaseModel):
@@ -210,6 +237,7 @@ class TranscriptRequest(BaseModel):
     )
     user_id: UserId | None = _USER_ID_FIELD
     answer_mode: AnswerMode | None = _ANSWER_MODE_FIELD
+    catalog_version: int | None = _CATALOG_VERSION_FIELD
 
     @model_validator(mode="after")
     def _exactly_one(self):
@@ -346,80 +374,11 @@ class IntentInfo(BaseModel):
     label: str = Field(..., description="Display name. Show this in UIs; `name` is the ID.")
     description: str | None = Field(..., description="What the intent's tool call does, or null if not set.")
     required_slots: list[str]
+    optional_slots: list[str] = Field(default_factory=list, description="Collected when said, but not needed to fire.")
     exemplar_count: int
     exemplars: list[str]
     executes_live: bool = Field(..., description="True if the intent has a `remote` binding and really runs; false if it's a mock.")
     remote: dict | None = Field(None, description="How the tool call executes on a remote MCP server, or null for a mock (see `RemoteBinding`).")
-
-
-CatalogName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
-Exemplar = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
-Label = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
-_LABEL_FIELD_DESCRIPTION = (
-    "Display name for UIs. Optional; if omitted, the name is shown humanized "
-    '(e.g. "check_refund_status" -> "Check Refund Status").'
-)
-
-
-class RemoteBinding(BaseModel):
-    """Runs the intent's tool call as a call to a tool on a remote MCP server."""
-
-    connection: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$")] = Field(
-        ..., description="A connection configured in the MCP connections file (see `GET /v1/connections`)."
-    )
-    tool: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)] = Field(
-        ..., description="The tool's name on that server (see `GET /v1/connections/{name}/tools`)."
-    )
-    arguments: dict | None = Field(
-        None,
-        description=(
-            "What to send the remote tool. `{name}` inside a string is replaced by the intent's slot "
-            "of that name; a value that is exactly `\"{name}\"` passes it through as-is; anything else "
-            "is sent unchanged. Omit to send the intent's slots as they are."
-        ),
-        examples=[{"module": "Leads", "criteria": "(Email:equals:{email})"}],
-    )
-    fallback: "RemoteBinding | None" = Field(
-        None,
-        description=(
-            "Another binding to try when this one finds nothing (e.g. search Leads, then Contacts). "
-            "It can have its own `fallback`. An error stops the chain: the call reports that error."
-        ),
-    )
-
-
-RemoteBinding.model_rebuild()
-
-
-class IntentUpdate(BaseModel):
-    label: Label | None = Field(default=None, description=_LABEL_FIELD_DESCRIPTION)
-    description: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)] | None = Field(
-        default=None,
-        description="What the intent's tool call does. The responder briefs the model with it when explaining a result.",
-    )
-    exemplars: list[Exemplar] = Field(
-        ..., min_length=1, max_length=200,
-        description="Phrasings retrieval matches against. Re-embedded on the next turn after a change.",
-    )
-    required_slots: list[str] = Field(
-        default_factory=list,
-        description="Slots collected before the tool call fires; they become its arguments. Each must be in `GET /v1/slots`.",
-    )
-    remote: RemoteBinding | None = Field(
-        None,
-        description=(
-            "Run the tool call on a remote MCP server. On create, omit it for a mock. On update, "
-            "omit it to keep the current binding, or send null to make the intent a mock."
-        ),
-    )
-
-
-class IntentCreate(IntentUpdate):
-    name: CatalogName = Field(..., description="Lowercase snake_case. Change it later with `POST /v1/intents/{name}/rename`.")
-
-
-class RenameRequest(BaseModel):
-    new_name: CatalogName = Field(..., description="Lowercase snake_case; must not already exist.")
 
 
 class LogResponse(BaseModel):
@@ -435,7 +394,10 @@ class HealthResponse(BaseModel):
 
 # -- session store ------------------------------------------------------------
 #
-# In-memory only: lost on restart, correct for a single process only.
+# CIP mode: ciap-api holds each call's state (see _locked_call); nothing below
+# keeps anything between requests.
+#
+# Otherwise in memory: lost on restart, correct for a single process only.
 # A call idle for config.CALL_IDLE_TIMEOUT_SECONDS is dropped -- on its next
 # request, or by the background sweep for calls nobody comes back to.
 
@@ -452,12 +414,60 @@ _now = time.monotonic  # patched in tests
 
 
 class CallSession:
+    # Applied turn ids kept per call, and how many of the latest turns' responses
+    # are kept to answer a repeat with (state size stays small).
+    APPLIED_IDS_KEPT = 500
+    RESPONSES_KEPT = 5
+
     def __init__(self):
         self.store = ConversationStateStore()
         self.turn_count = 0
+        self.applied_ids: list[int] = []
+        self.responses: dict[str, dict] = {}  # turn id -> its response, newest last
+        # Turns that called (or were about to call) a tool, and the one doing so
+        # now: see _claim_turn.
+        self.claimed_ids: list[int] = []
+        self.in_progress: dict | None = None
+        # CIP mode: the state as loaded and its version, for a claim and the save.
+        self.loaded_state: dict | None = None
+        self.version = 0
         self.last_activity = _now()
         # One in-flight turn per call: process_utterance mutates the frame list.
         self.lock = threading.Lock()
+
+    @classmethod
+    def from_state(cls, state):
+        """A session from the state ciap-api saved for the call (None: a new call)."""
+        session = cls()
+        if state:
+            session.store = ConversationStateStore.from_dict(state.get("store"))
+            session.turn_count = int(state.get("turn_count") or 0)
+            session.applied_ids = [int(i) for i in state.get("applied_turn_ids") or []]
+            session.responses = dict(state.get("turn_responses") or {})
+            session.claimed_ids = [int(i) for i in state.get("claimed_turn_ids") or []]
+            session.in_progress = state.get("in_progress")
+        session.loaded_state = state
+        return session
+
+    def to_state(self):
+        # A finished request leaves no turn in progress.
+        return {"store": views.to_jsonable(self.store.to_dict()), "turn_count": self.turn_count,
+                "applied_turn_ids": self.applied_ids, "turn_responses": self.responses,
+                "claimed_turn_ids": self.claimed_ids, "in_progress": None}
+
+    def applied(self, turn_id):
+        """(already applied, the response it got if still kept)."""
+        if turn_id is None or turn_id not in self.applied_ids:
+            return False, None
+        return True, self.responses.get(str(turn_id))
+
+    def remember(self, turn_id, view):
+        if turn_id is None:
+            return
+        self.applied_ids = (self.applied_ids + [turn_id])[-self.APPLIED_IDS_KEPT:]
+        self.responses[str(turn_id)] = views.to_jsonable(view)
+        for old in list(self.responses)[:-self.RESPONSES_KEPT]:
+            del self.responses[old]
 
     def touch(self):
         self.last_activity = _now()
@@ -575,29 +585,164 @@ async def _sweep_idle_calls_forever():
             logger.exception("idle-call sweep failed")
 
 
+def _tenant_catalog(tenant_id: str, min_version: int | None = None) -> catalog.Catalog:
+    try:
+        return catalog.for_tenant(tenant_id, min_version)
+    except catalog.CatalogUnavailable as exc:
+        logger.error("tenant=%s %s", tenant_id, exc)
+        raise ApiError(503, "catalog_unavailable", f"Tenant {tenant_id!r}'s intent catalog couldn't be loaded; retry.") from exc
+
+
+@contextmanager
+def _locked_call(key: CallKey, *, create: bool, source: str = "turn", user_id: str | None = None,
+                 touch: bool = True, save: bool = True):
+    """The call's session, held for one request. In memory: the live session
+    under its lock. CIP mode: loaded from ciap-api and, when `save` and the
+    request succeeds, saved back -- refused (ciap_api.StateConflict) if
+    another request saved the call in between. `create` starts an unknown call
+    instead of answering 404."""
+    if not ciap_api.enabled():
+        session = _get_or_create_session(key, source, user_id) if create else _get_session(key, touch)
+        with session.lock:
+            if _calls.get(key) is not session:
+                # Deleted, reset or expired while this request waited for the
+                # lock: applying it to the dropped session would lose it silently.
+                raise ApiError(409, "call_replaced", f"Call {key[1]!r} was deleted or reset while this request waited; resend it.")
+            yield session
+        return
+    try:
+        state, version = ciap_api.load_state(*key)
+    except ciap_api.NotFound:
+        if not create:
+            raise ApiError(404, "call_not_found", f"No call {key[1]!r} for tenant {key[0]!r}. Send a turn to start one.")
+        state, version = None, 0
+    except ciap_api.CiapApiError as exc:
+        raise ApiError(503, "state_unavailable", f"Couldn't load call {key[1]!r}'s state; retry. ({exc})") from exc
+    session = CallSession.from_state(state)
+    session.version = version
+    yield session
+    if save:
+        try:
+            # session.version: moved on by a claim (_claim_turn) during the request.
+            ciap_api.save_state(*key, session.to_state(), session.version)
+        except ciap_api.StateConflict:
+            raise
+        except ciap_api.CiapApiError as exc:
+            raise ApiError(503, "state_unavailable", f"Couldn't save call {key[1]!r}'s state; retry. ({exc})") from exc
+
+
+class TurnInProgress(Exception):
+    """Another copy of this turn has claimed it and is calling its tool now."""
+
+
+def _retrying(key: CallKey, work):
+    """Run `work()` (which uses _locked_call), once more if ciap-api refused
+    its save (or a claim) because the call moved on meanwhile. Turns for one
+    call arrive in order, one at a time, so this is only a request seen twice
+    -- and a turn carries its id, so the second run finds it applied and
+    returns its response instead of running it again. While another copy of
+    the turn is still running (it claimed it), wait for it, up to
+    TURN_IN_PROGRESS_WAIT_SECONDS, and return what it saved."""
+    conflicts = 0
+    waiting_since = None
+    while True:
+        try:
+            return work()
+        except ciap_api.StateConflict as exc:
+            conflicts += 1
+            if conflicts > 1:
+                raise ApiError(409, "state_conflict", f"Call {key[1]!r} kept changing while this request ran; resend it.") from exc
+            logger.warning("%s state changed while a request ran; running it again on the new state", _who(key))
+        except TurnInProgress as exc:
+            waiting_since = waiting_since or time.monotonic()
+            if time.monotonic() - waiting_since > config.TURN_IN_PROGRESS_WAIT_SECONDS:
+                raise ApiError(409, "turn_in_progress", f"{exc} Resend it later for its response.") from None
+            time.sleep(0.25)
+
+
+def _turn_claim(key: CallKey, session: CallSession, turn_id: int | None):
+    """What runs before the turn's first tool call (mcp_tools.before_remote_call).
+
+    CIP mode, with a turn id: the call's state as loaded is saved again, marked
+    "turn_id in progress" and with turn_id among the claimed turns, at the
+    loaded version. Only one copy of a turn can save that, so only one calls
+    the tool; the other's claim is refused (StateConflict) before anything is
+    sent. Turns that call no tool never claim (no extra save). Raises
+    TurnInProgress / ApiError up front when another copy holds or used the turn.
+    """
+    if not ciap_api.enabled() or turn_id is None:
+        return None
+    current = session.in_progress or {}
+    if current.get("turn_id") == turn_id and time.time() - float(current.get("since") or 0) < config.TURN_CLAIM_STALE_SECONDS:
+        raise TurnInProgress(f"Turn {turn_id} of call {key[1]!r} is being run by another request.")
+    if turn_id in session.claimed_ids:
+        # Claimed earlier, never saved as applied: that copy may have called the
+        # tool before it was lost. Not called a second time.
+        raise ApiError(409, "turn_claim_lost",
+                       f"Turn {turn_id} of call {key[1]!r} already called its tool but its result was lost; it isn't run again.")
+    claimed = []
+
+    def claim():
+        if claimed:
+            return
+        state = dict(session.loaded_state or {})
+        state["claimed_turn_ids"] = ([int(i) for i in state.get("claimed_turn_ids") or []] + [turn_id])[-CallSession.APPLIED_IDS_KEPT:]
+        state["in_progress"] = {"turn_id": turn_id, "since": time.time()}
+        session.version = ciap_api.save_state(*key, state, session.version)
+        session.claimed_ids = state["claimed_turn_ids"]
+        claimed.append(True)
+
+    return claim
+
+
+def _once(key: CallKey, work):
+    """Run `work()` without retrying: for requests whose turns carry no ids, so
+    a conflict can't be told apart from a request seen twice. 409 to the caller."""
+    try:
+        return work()
+    except ciap_api.StateConflict as exc:
+        raise ApiError(409, "state_conflict", f"Call {key[1]!r} changed while this request ran; check it and resend.") from exc
+
+
 def _run_turn(
     key: CallKey, session: CallSession, text: str, speaker: str, user_id: str | None = None, debug: bool = False,
-    answer_mode: str | None = None,
+    answer_mode: str | None = None, turn_id: int | None = None,
 ) -> dict:
-    """Process one turn under the call's lock. Caller holds no lock."""
-    with session.lock:
-        try:
-            trace = session.store.process_utterance(text, speaker=speaker, answer_mode=answer_mode)
-        except Exception as exc:
-            logger.exception("%s process_utterance failed on %r", _who(key, user_id), text)
-            call_log.log_event(
-                "turn_error", **_ids(key, user_id), utterance=text, error=f"{type(exc).__name__}: {exc}"
-            )
-            raise ApiError(500, "pipeline_error", f"Couldn't process that turn ({type(exc).__name__}).") from exc
-        session.turn_count += 1
-        session.touch()
-        view = views.build_turn_view(trace, session.store, session.turn_count)
-
+    """Process one turn. The caller holds the call (_locked_call) and has set
+    its tenant's catalog (catalog.using). A turn id the call has already
+    applied isn't run again."""
+    done, response = session.applied(turn_id)
+    if done:
+        logger.info("%s turn id %s already applied; not running it again", _who(key, user_id), turn_id)
+        if response is None:
+            raise ApiError(409, "turn_already_applied", f"Turn {turn_id} was already applied to call {key[1]!r}.")
+        return response
+    claim = _turn_claim(key, session, turn_id)
+    hook = mcp_tools.before_remote_call.set(claim)
+    try:
+        trace = session.store.process_utterance(text, speaker=speaker, answer_mode=answer_mode)
+    except (ciap_api.StateConflict, TurnInProgress):
+        raise  # lost the claim to another copy of this turn: _retrying sorts it out
+    except ciap_api.CiapApiError as exc:
+        raise ApiError(503, "state_unavailable", f"Couldn't claim turn {turn_id} of call {key[1]!r}; retry. ({exc})") from exc
+    except Exception as exc:
+        logger.exception("%s process_utterance failed (%d chars)", _who(key, user_id), len(text))
+        call_log.log_event(
+            "turn_error", **_ids(key, user_id), utterance=text, error=f"{type(exc).__name__}: {exc}"
+        )
+        raise ApiError(500, "pipeline_error", f"Couldn't process that turn ({type(exc).__name__}).") from exc
+    finally:
+        mcp_tools.before_remote_call.reset(hook)
+    session.turn_count += 1
+    session.touch()
+    view = views.build_turn_view(trace, session.store, session.turn_count)
+    # The plain-text log carries no caller speech or tool arguments (emails,
+    # phone numbers); the full turn is in the call log (call_log.py).
     fired = view["mcp"]["fired_this_turn"]
-    tools = ", ".join(f"{c['tool']}({c['arguments']})" for c in fired)
+    tools = ", ".join(c["tool"] for c in fired)
     logger.info(
-        "%s turn=%d %r -> %s/%s intent=%s%s",
-        _who(key, user_id), view["turn_index"], text,
+        "%s turn=%d (%d chars) -> %s/%s intent=%s%s",
+        _who(key, user_id), view["turn_index"], len(text),
         view["intent"]["decision"], view["intent"]["turn_type"], view["intent"]["selected_intent"],
         f" | MCP: {tools}" if fired else "",
     )
@@ -605,8 +750,9 @@ def _run_turn(
     call_log.log_event(
         "turn", **_ids(key, user_id), turn_index=view["turn_index"], utterance=text, view=view, raw_trace=raw
     )
+    session.remember(turn_id, view)
     if debug:
-        view["debug"] = raw
+        view = {**view, "debug": raw}
     return view
 
 
@@ -632,11 +778,12 @@ app = FastAPI(
         "`/v1/tenants/{tenant_id}/calls/{call_id}`. Workflow: `POST .../turns` "
         "(the first turn for a new ID starts the call; repeat) -> `GET` the call -> "
         "`DELETE` it on hangup. Turns may carry the call agent's `user_id`, which is only logged.\n\n"
-        "All errors use `{\"error\": {\"code\", \"message\"}}`. See API_DOCUMENTATION.md "
-        "for the full reference, including production handover items "
-        "(no auth, in-memory sessions). A call idle for "
-        f"{config.CALL_IDLE_TIMEOUT_SECONDS}s is dropped; later requests to it return "
-        "404 `call_expired`."
+        "All errors use `{\"error\": {\"code\", \"message\"}}`. `/v1` needs `X-Api-Key` when "
+        "`AGENT_ASSIST_API_KEY` is set.\n\n"
+        "CIP mode (`CIAP_API_BASE_URL` set): each tenant's intents come from CIP, and each call's state "
+        "is loaded from and saved to ciap-api around every turn, so any instance can serve any turn. "
+        "Otherwise every tenant gets the built-in catalog and calls live in memory: a call idle for "
+        f"{config.CALL_IDLE_TIMEOUT_SECONDS}s is dropped, and later requests to it return 404 `call_expired`."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -659,13 +806,23 @@ app = FastAPI(
 app.include_router(demo_router)
 
 
+@app.middleware("http")
+async def _service_auth(request: Request, call_next):
+    """/v1 needs X-Api-Key when config.API_KEY is set (ciap-kafka sends it).
+    The request's X-Correlation-Id goes on to ciap-api with the call's state."""
+    if config.API_KEY and request.url.path.startswith("/v1/"):
+        given = request.headers.get("x-api-key", "")
+        if not hmac.compare_digest(given.encode(), config.API_KEY.encode()):
+            return _error_response(401, "unauthorized", "Missing or wrong X-Api-Key.")
+    token = ciap_api.correlation_id.set(request.headers.get("x-correlation-id"))
+    try:
+        return await call_next(request)
+    finally:
+        ciap_api.correlation_id.reset(token)
+
+
 @app.exception_handler(ApiError)
 async def _api_error_handler(request: Request, exc: ApiError):
-    return _error_response(exc.status, exc.code, exc.message)
-
-
-@app.exception_handler(catalog.CatalogError)
-async def _catalog_error_handler(request: Request, exc: catalog.CatalogError):
     return _error_response(exc.status, exc.code, exc.message)
 
 
@@ -704,18 +861,24 @@ def get_call(tenant_id: str, call_id: str):
     """Current state of every frame opened in this call, including each frame's
     `tool_call` and (for tools that really execute) `tool_result`."""
     key = (tenant_id, call_id)
-    session = _get_session(key, touch=False)
-    with session.lock:
+    with catalog.using(_tenant_catalog(tenant_id)), _locked_call(key, create=False, touch=False, save=False) as session:
         return _call_state(key, session)
 
 
 @app.delete("/v1/tenants/{tenant_id}/calls/{call_id}", status_code=204, tags=["calls"], responses=_NOT_FOUND)
 def delete_call(tenant_id: str, call_id: str):
-    """Drop a call's state. Optional: calls idle for the configured timeout are
-    dropped automatically."""
+    """End a call. In memory its state is dropped (calls idle for the
+    configured timeout are dropped automatically). CIP mode: nothing to free --
+    ciap-api keeps the call's last state with its record."""
     key = (tenant_id, call_id)
-    _get_session(key, touch=False)
-    _calls.pop(key, None)
+    if ciap_api.enabled():
+        with _locked_call(key, create=False, save=False):
+            pass
+    else:
+        session = _get_session(key, touch=False)
+        with session.lock:  # let a turn in flight finish first
+            if _calls.get(key) is session:
+                del _calls[key]
     logger.info("%s deleted", _who(key))
     call_log.log_event("call_deleted", **_ids(key))
 
@@ -724,8 +887,16 @@ def delete_call(tenant_id: str, call_id: str):
 def reset_call(tenant_id: str, call_id: str):
     """Wipe a call's frames and turn counter but keep the same IDs."""
     key = (tenant_id, call_id)
-    _get_session(key)
-    _calls[key] = CallSession()
+    if ciap_api.enabled():
+        def work():
+            with _locked_call(key, create=False) as session:
+                session.store, session.turn_count = ConversationStateStore(), 0
+        _retrying(key, work)
+    else:
+        session = _get_session(key)
+        with session.lock:  # let a turn in flight finish first
+            if _calls.get(key) is session:
+                _calls[key] = CallSession()
     logger.info("%s reset", _who(key))
     call_log.log_event("call_reset", **_ids(key))
     return NewCallResponse(tenant_id=tenant_id, call_id=call_id)
@@ -776,8 +947,14 @@ def post_turn(
     `RESPONDER_TIMEOUT_SECONDS` (`RESPONDER_FULL_TIMEOUT_SECONDS` for `full`).
     """
     key = (tenant_id, call_id)
-    session = _get_or_create_session(key, source="turn", user_id=turn.user_id)
-    return _run_turn(key, session, turn.utterance, turn.speaker, turn.user_id, debug, turn.answer_mode)
+    cat = _tenant_catalog(tenant_id, turn.catalog_version)
+
+    def work():
+        with catalog.using(cat), _locked_call(key, create=True, user_id=turn.user_id) as session:
+            return _run_turn(key, session, turn.utterance, turn.speaker, turn.user_id, debug, turn.answer_mode,
+                             turn.turn_id)
+
+    return _retrying(key, work)
 
 
 @app.post(
@@ -807,145 +984,71 @@ def post_transcript(tenant_id: TenantIdPath, call_id: CallIdPath, body: Transcri
         turns = [(speaker.lower(), text) for speaker, text in parsed]
 
     key = (tenant_id, call_id)
-    session = _get_or_create_session(key, source="turn", user_id=body.user_id)
-    results = [
-        _run_turn(key, session, text, speaker, body.user_id, answer_mode=body.answer_mode) for speaker, text in turns
-    ]
-    with session.lock:
-        frames = views.frames_view(session.store)
-    return {"tenant_id": tenant_id, "call_id": call_id, "turns": results, "frames": frames}
+    cat = _tenant_catalog(tenant_id, body.catalog_version)
+
+    def work():
+        with catalog.using(cat), _locked_call(key, create=True, user_id=body.user_id) as session:
+            results = [
+                _run_turn(key, session, text, speaker, body.user_id, answer_mode=body.answer_mode)
+                for speaker, text in turns
+            ]
+            return {"tenant_id": tenant_id, "call_id": call_id, "turns": results,
+                    "frames": views.frames_view(session.store)}
+
+    # Not retried: re-running the turns would repeat their tool calls.
+    return _once(key, work)
 
 
 # -- catalog ------------------------------------------------------------------
 #
-# Reads are the pipeline's live catalog; writes go through catalog.py, which
-# saves to config.CATALOG_PATH and re-embeds exemplars on the next turn.
-# Names are the ID, and an intent's tool calls are named after it. Renaming
-# moves one everywhere at once: the catalog, and every live call's frames and
-# tool calls. `label` is the display name; every view that carries an intent
-# or tool name carries its label next to it, so UIs never need to show the
-# raw name.
+# Read-only: in CIP mode each tenant's catalog is managed in CIP (Settings ->
+# Agent Assist) and read from ciap-api; otherwise every tenant gets the
+# built-in one (intents.py). Every view that carries an intent or tool name
+# carries its label next to it, so UIs never need to show the raw name.
 
 
-@contextmanager
-def _all_calls_locked():
-    """Hold every live call's lock, so no turn runs while a rename moves the
-    catalog and the frames over. Yields the (call_id, session) pairs."""
-    with ExitStack() as stack:
-        sessions = list(_calls.items())
-        for _, session in sessions:
-            stack.enter_context(session.lock)
-        yield sessions
-
-
-def _intent_info(name: str) -> IntentInfo:
-    spec = INTENTS.get(name)
+def _intent_info(cat: catalog.Catalog, name: str) -> IntentInfo:
+    spec = cat.intents.get(name)
     if spec is None:
         raise ApiError(404, "intent_not_found", f"No intent named {name!r}.")
     return IntentInfo(
         name=name,
-        label=views.intent_label(name),
+        label=spec.get("label") or views.humanize(name),
         description=spec.get("description"),
         required_slots=spec["required_slots"],
+        optional_slots=spec.get("optional_slots", []),
         exemplar_count=len(spec["exemplars"]),
         exemplars=spec["exemplars"],
-        executes_live=executes_live(name),
+        executes_live=spec.get("remote") is not None,
         remote=spec.get("remote"),
     )
 
 
-@app.get("/v1/intents", response_model=list[IntentInfo], tags=["catalog"])
-def list_intents():
-    """Every intent the pipeline can recognise: its display label, what its
-    tool call does, its required slots, its retrieval exemplars, and whether
-    it really executes (`remote`) or is a mock that only builds the call."""
-    return [_intent_info(name) for name in list(INTENTS)]
+@app.get("/v1/tenants/{tenant_id}/intents", response_model=list[IntentInfo], tags=["catalog"])
+def list_intents(tenant_id: TenantIdPath):
+    """Every intent the tenant's turns are matched against: its display label,
+    what its tool call does, its slots, its phrases (exemplars), and whether it
+    really executes (`remote`) or is a mock that only builds the call."""
+    cat = _tenant_catalog(tenant_id)
+    return [_intent_info(cat, name) for name in cat.intents]
 
 
-@app.get("/v1/intents/{name}", response_model=IntentInfo, tags=["catalog"], responses=_CATALOG_NOT_FOUND)
-def get_intent(name: str):
-    return _intent_info(name)
+@app.get("/v1/tenants/{tenant_id}/intents/{name}", response_model=IntentInfo, tags=["catalog"], responses=_CATALOG_NOT_FOUND)
+def get_intent(tenant_id: TenantIdPath, name: str):
+    return _intent_info(_tenant_catalog(tenant_id), name)
 
 
-@app.post(
-    "/v1/intents", response_model=IntentInfo, status_code=201, tags=["catalog"],
-    responses={**_INVALID, 409: {"model": ErrorResponse, "description": "Intent already exists."}},
-)
-def create_intent(body: IntentCreate):
-    """Add an intent. It's live from the next turn of every call. Without
-    `remote` it's a mock: it builds a tool call but doesn't execute."""
-    remote = body.remote.model_dump(exclude_none=True) if body.remote else None
-    catalog.put_intent(
-        body.name, body.label, body.description, body.exemplars, body.required_slots, create=True, remote=remote
-    )
-    call_log.log_event("intent_created", intent=body.name)
-    return _intent_info(body.name)
+class SlotTypes(BaseModel):
+    types: list[str] = Field(..., description="Slot types a tenant's slots can have (CIP's slot types).")
+    named: list[str] = Field(..., description="Slot names with their own extractor, used whatever the slot's type.")
 
 
-@app.put(
-    "/v1/intents/{name}", response_model=IntentInfo, tags=["catalog"],
-    responses={**_CATALOG_NOT_FOUND, **_INVALID},
-)
-def update_intent(name: str, body: IntentUpdate):
-    """Replace an intent's label, description, exemplars and required slots
-    (send the full intent; an omitted label falls back to the humanized name),
-    and its `remote` binding if sent. Frames already open keep their slots but
-    are checked against the new `required_slots` from their next turn."""
-    if "remote" not in body.model_fields_set:
-        remote = catalog.KEEP
-    else:
-        remote = body.remote.model_dump(exclude_none=True) if body.remote else None
-    catalog.put_intent(
-        name, body.label, body.description, body.exemplars, body.required_slots, create=False, remote=remote
-    )
-    call_log.log_event("intent_updated", intent=name)
-    return _intent_info(name)
-
-
-@app.post(
-    "/v1/intents/{name}/rename", response_model=IntentInfo, tags=["catalog"],
-    responses={**_CATALOG_NOT_FOUND, **_INVALID, 409: {"model": ErrorResponse, "description": "`new_name` already exists."}},
-)
-def rename_intent(name: str, body: RenameRequest):
-    """Rename an intent in one step. Its label, exemplars, slots and binding
-    move with it, and frames in live calls switch to the new name, along with
-    tool calls they already built (a frame waiting on slots keeps waiting).
-    Past log records keep the old name."""
-    with _all_calls_locked() as sessions:
-        catalog.rename_intent(name, body.new_name)
-        moved = 0
-        for _, session in sessions:
-            for frame in session.store.frames:
-                if frame.intent == name:
-                    frame.intent = body.new_name
-                    moved += 1
-                if frame.tool_call and frame.tool_call.get("tool") == name:
-                    frame.tool_call = {**frame.tool_call, "tool": body.new_name}
-    logger.info("intent %s renamed to %s (%d live frame(s) moved)", name, body.new_name, moved)
-    call_log.log_event("intent_renamed", intent=body.new_name, old_name=name, live_frames=moved)
-    return _intent_info(body.new_name)
-
-
-@app.delete("/v1/intents/{name}", status_code=204, tags=["catalog"], responses={**_CATALOG_NOT_FOUND, **_CONFLICT})
-def delete_intent(name: str):
-    """Remove an intent. Refused while a live call has a frame for it still
-    waiting on slots; finish, reset or delete those calls first."""
-    with catalog.lock:
-        waiting = sorted(
-            f"{tenant_id}/{call_id}" for (tenant_id, call_id), session in list(_calls.items())
-            if any(f.intent == name and f.status in ("OPEN", "AWAITING_INFO") for f in session.store.frames)
-        )
-        if waiting:
-            raise ApiError(409, "intent_in_use", f"Intent {name!r} has frames waiting on slots in call(s) {waiting}.")
-        catalog.delete_intent(name)
-    call_log.log_event("intent_deleted", intent=name)
-
-
-@app.get("/v1/slots", response_model=list[str], tags=["catalog"])
+@app.get("/v1/slots", response_model=SlotTypes, tags=["catalog"])
 def list_slots():
-    """Slot names an intent's `required_slots` can use. Each has a built-in
-    extractor; adding a new slot type needs a code change in slots.py."""
-    return sorted(SLOT_EXTRACTORS)
+    """How slots are read. A slot named like one of `named` uses that
+    extractor; any other goes by its type (`OPTION` matches the slot's options;
+    `TEXT` is read by the LLM when the slot is the one a request is waiting on)."""
+    return SlotTypes(types=list(catalog.SLOT_TYPES), named=sorted(SLOT_EXTRACTORS))
 
 
 # -- MCP connections -------------------------------------------------------------
@@ -959,6 +1062,26 @@ class RemoteToolInfo(BaseModel):
     allowed: bool = Field(
         ..., description="False if the connection's `allowed_tools` leaves this tool out: it can't be bound or called."
     )
+
+
+@app.get(
+    "/v1/tenants/{tenant_id}/connections/{name}/tools", response_model=list[RemoteToolInfo], tags=["connections"],
+    responses={
+        404: {"model": ErrorResponse, "description": "No such connection for the tenant (`connection_not_found`)."},
+        502: {"model": ErrorResponse, "description": "The MCP server couldn't be reached or refused (`connection_failed`)."},
+    },
+)
+def list_tenant_connection_tools(
+    tenant_id: TenantIdPath, name: str,
+    catalog_version: int | None = Query(
+        None, ge=1, description="The tenant's current catalog version (ciap-api sends it), so a connection "
+        "just saved, signed in or signed out isn't served from a cached copy."),
+):
+    """The tools one of the tenant's connections offers (CIP mode: a connection
+    configured in CIP; otherwise the shared connections file). CIP's Settings
+    use it to pick the tools intents may call."""
+    with catalog.using(_tenant_catalog(tenant_id, catalog_version)):
+        return list_connection_tools(name)
 
 
 @app.get("/v1/connections", response_model=list[str], tags=["connections"])
@@ -1046,29 +1169,35 @@ def override_slot(tenant_id: str, call_id: str, frame_id: int, slot_name: str, b
     if not config.SLOT_OVERRIDE_ENABLED:
         raise ApiError(404, "endpoint_disabled", "Slot override is archived and disabled on this server.")
     key, user_id = (tenant_id, call_id), body.user_id
-    session = _get_session(key)
-    with session.lock:
-        store = session.store
-        frame = store.get_frame(frame_id)
-        if frame is None:
-            raise ApiError(404, "frame_not_found", f"No frame #{frame_id} in call {call_id!r}.")
-        if frame.status == "REVERTED":
-            raise ApiError(409, "frame_reverted", f"Frame #{frame_id} was reverted; nothing to override.")
-        if slot_name not in INTENTS.get(frame.intent, {}).get("required_slots", []):
-            raise ApiError(422, "invalid_slot", f"{slot_name!r} isn't a slot on {frame.intent}.")
+    cat = _tenant_catalog(tenant_id)
 
-        try:
-            frame, refired = store.override_slot(frame_id, slot_name, body.value)
-        except ValueError as exc:
-            call_log.log_event(
-                "override_rejected", **_ids(key, user_id), frame_id=frame_id, slot=slot_name,
-                value=body.value, error=str(exc),
-            )
-            raise ApiError(422, "invalid_slot_value", str(exc)) from exc
+    def work():
+        with catalog.using(cat), _locked_call(key, create=False) as session:
+            store = session.store
+            frame = store.get_frame(frame_id)
+            if frame is None:
+                raise ApiError(404, "frame_not_found", f"No frame #{frame_id} in call {call_id!r}.")
+            if frame.status == "REVERTED":
+                raise ApiError(409, "frame_reverted", f"Frame #{frame_id} was reverted; nothing to override.")
+            if slot_name not in cat.intents.get(frame.intent, {}).get("required_slots", []):
+                raise ApiError(422, "invalid_slot", f"{slot_name!r} isn't a slot on {frame.intent}.")
 
-        session.turn_count += 1
-        session.touch()
-        view = views.build_turn_view(views.build_override_trace(frame, slot_name, refired), store, session.turn_count)
+            try:
+                frame, refired = store.override_slot(frame_id, slot_name, body.value)
+            except ValueError as exc:
+                call_log.log_event(
+                    "override_rejected", **_ids(key, user_id), frame_id=frame_id, slot=slot_name,
+                    value=body.value, error=str(exc),
+                )
+                raise ApiError(422, "invalid_slot_value", str(exc)) from exc
+
+            session.turn_count += 1
+            session.touch()
+            view = views.build_turn_view(views.build_override_trace(frame, slot_name, refired), store, session.turn_count)
+            return frame, refired, view
+
+    # Not retried: a re-run would dispatch the corrected tool call again.
+    frame, refired, view = _once(key, work)
 
     logger.info(
         "%s turn=%d override %s#%d.%s -> %r%s",

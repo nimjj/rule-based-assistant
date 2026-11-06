@@ -1,198 +1,172 @@
-# Admin edits to the intent catalog (the /v1/intents write endpoints in
-# server.py).
+# The intent catalog a turn runs against: which intents a tenant has, the
+# phrases that express each one (its exemplars), the slots it collects and,
+# for the built-in catalog, the remote tool it calls.
 #
-# intents.py stays the shipped defaults. Once anything is edited, the whole
-# catalog is written to config.CATALOG_PATH and loaded over those defaults at
-# startup, so edits survive a restart.
+# CIP mode (config.CIAP_API_BASE_URL set): every tenant has its own catalog,
+# managed in CIP (Settings -> Agent Assist) and read from ciap-api -- this
+# service never stores or edits one. It's cached per tenant and reloaded when a
+# turn carries a newer catalog_version (ciap-api bumps it on every save), or
+# after config.CATALOG_MAX_AGE_SECONDS for turns sent without one.
 #
-# INTENTS is updated in place because every other module imported it by
-# reference. Specs are always replaced whole, never mutated, so a reader
-# mid-turn sees either the old spec or the new one.
+# Otherwise the built-in catalog (intents.py) serves every tenant: local
+# development, the demo and the tests.
 #
-# Validation that needs the HTTP layer's context (live calls, request shape)
-# lives in server.py; this module checks the catalog's own consistency and
-# raises CatalogError for anything that would leave it broken.
+# The pipeline modules read the catalog of the turn in progress through
+# current() / intents(); server.py sets it around each turn with using().
+# Specs keep the built-in shape (`remote`: the MCP tool the intent calls, on a
+# connection of the tenant's own in CIP mode -- see mcp_client):
+#   {"label", "description", "exemplars", "required_slots", "optional_slots", "remote"}
+# and slots(name) is the slot's {"type", "label", "options", "prompt", "description"}.
 
-import copy
-import json
-import os
-import re
 import threading
-from pathlib import Path
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 
+from ciap import call_log
+from ciap import ciap_api
 from ciap import config
-from ciap.pipeline import embeddings
-from ciap.pipeline.intents import INTENTS
-from ciap.integrations import mcp_client, zoho
-from ciap.integrations.mcp_tools import placeholders
-from ciap.pipeline.slots import SLOT_EXTRACTORS
+from ciap.pipeline.intents import INTENTS as BUILTIN_INTENTS
 
-# Serialises edits and the file write. Turns don't take it.
-lock = threading.RLock()
+logger = call_log.logger
 
+# Slot types CIP offers (app.assist_slots.type). Extraction picks by type
+# unless the slot's name has its own extractor (slots.SLOT_EXTRACTORS).
+SLOT_TYPES = ("TEXT", "NUMBER", "DATE", "TIME", "PHONE", "EMAIL", "CURRENCY", "OPTION")
 
-class CatalogError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message)
-        self.status, self.code, self.message = status, code, message
+# The built-in catalog's slots: each has a named extractor; the type is what
+# CIP would call it.
+_BUILTIN_SLOT_TYPES = {"email": "EMAIL", "phone": "PHONE", "new_date": "DATE"}
 
 
-# -- persistence --------------------------------------------------------------
+class CatalogUnavailable(Exception):
+    """The tenant's catalog couldn't be loaded and none is cached."""
 
 
-def load():
-    """Replace the shipped defaults with the saved catalog, if one exists."""
-    path = Path(config.CATALOG_PATH)
-    if not path.exists():
+@dataclass(eq=False)
+class Catalog:
+    tenant_id: str | None
+    version: object
+    intents: dict
+    slot_specs: dict = field(default_factory=dict)
+    loaded_at: float = 0.0
+
+    def slot(self, name):
+        return self.slot_specs.get(name) or {"type": "TEXT", "label": name, "options": []}
+
+
+def _builtin():
+    slot_names = {s for spec in BUILTIN_INTENTS.values() for s in spec["required_slots"]}
+    slots = {n: {"type": _BUILTIN_SLOT_TYPES.get(n, "TEXT"), "label": n.replace("_", " "), "options": []} for n in slot_names}
+    intents = {name: {**spec, "optional_slots": []} for name, spec in BUILTIN_INTENTS.items()}
+    return Catalog(tenant_id=None, version="builtin", intents=intents, slot_specs=slots)
+
+
+BUILTIN = _builtin()
+
+_current: ContextVar[Catalog | None] = ContextVar("catalog", default=None)
+
+
+def current():
+    """The catalog of the turn in progress (the built-in one outside a turn)."""
+    return _current.get() or BUILTIN
+
+
+def intents():
+    return current().intents
+
+
+def slot(name):
+    return current().slot(name)
+
+
+@contextmanager
+def using(catalog):
+    token = _current.set(catalog)
+    try:
+        yield catalog
+    finally:
+        _current.reset(token)
+
+
+# -- per-tenant catalogs from ciap-api ------------------------------------------------
+
+_cache: dict[str, Catalog] = {}
+_tenant_locks: dict[str, threading.Lock] = {}
+_locks_lock = threading.Lock()
+_clock = time.monotonic  # patched in tests
+
+
+def from_ciap(tenant_id, body):
+    """A Catalog from ciap-api's catalog response."""
+    intents, slots = {}, {}
+    for i in body.get("intents") or []:
+        phrases = [p for p in i.get("phrases") or [] if p and p.strip()]
+        if not phrases:
+            continue  # nothing to recognise it by
+        required, optional = [], []
+        for s in i.get("slots") or []:
+            (required if s.get("required", True) else optional).append(s["name"])
+            slots.setdefault(s["name"], {
+                "type": (s.get("type") or "TEXT").upper(),
+                "label": s.get("label") or s["name"],
+                "options": s.get("options") or [],
+                "prompt": s.get("prompt"),
+                "description": s.get("description"),
+            })
+        spec = {"exemplars": phrases, "required_slots": required, "optional_slots": optional}
+        if i.get("label"):
+            spec["label"] = i["label"]
+        if i.get("description"):
+            spec["description"] = i["description"]
+        if i.get("remote"):
+            spec["remote"] = i["remote"]  # the tool it calls on one of the tenant's connections (mcp_client)
+        intents[i["name"]] = spec
+    return Catalog(tenant_id=tenant_id, version=body.get("version", 0), intents=intents, slot_specs=slots,
+                   loaded_at=_clock())
+
+
+def _fresh(cached, min_version):
+    if cached is None:
         return False
-    data = json.loads(path.read_text(encoding="utf-8"))
-    saved = data["intents"]
-    if "tools" in data:
-        saved = _merge_saved_tools(saved, data["tools"])
-    with lock:
-        INTENTS.clear()
-        for name, spec in saved.items():
-            INTENTS[name] = _intent_spec(
-                spec.get("label"), spec.get("description"), spec["exemplars"], spec["required_slots"], spec.get("remote")
-            )
-    embeddings.invalidate_index()
-    return True
+    if min_version is not None and cached.version < min_version:
+        return False
+    return _clock() - cached.loaded_at < config.CATALOG_MAX_AGE_SECONDS
 
 
-def _merge_saved_tools(intents, tools):
-    """Catalogs saved before intents carried their own tool kept tools in a
-    separate map, each intent naming the one it fired: the intent takes over
-    that tool's description and binding."""
-    # Older still, the live Zoho tool was marked "backend": "zoho_lead_search",
-    # or (before that) only by its name. Either way it now runs through the
-    # Zoho MCP connection.
-    if not any(t.get("remote") for t in tools.values()):
-        legacy = [n for n, t in tools.items() if t.get("backend") == "zoho_lead_search"]
-        if not legacy and "search_zoho_lead" in tools:
-            legacy = ["search_zoho_lead"]
-        tools = {**tools, **{n: {**tools[n], "remote": copy.deepcopy(zoho.LEAD_SEARCH)} for n in legacy}}
-    merged = {}
-    for name, spec in intents.items():
-        tool = tools.get(spec.get("tool")) or {}
-        merged[name] = {**spec, "description": tool.get("description"), "remote": tool.get("remote")}
-    return merged
+def for_tenant(tenant_id, min_version=None):
+    """The catalog for a tenant's turn. CIP mode: its own, from ciap-api, at
+    least min_version (the turn's catalog_version). Otherwise the built-in one.
+    Raises CatalogUnavailable when ciap-api can't be reached and nothing is
+    cached; with a cached copy it logs and carries on with that."""
+    if not ciap_api.enabled():
+        return BUILTIN
+    cached = _cache.get(tenant_id)
+    if _fresh(cached, min_version):
+        return cached
+    with _locks_lock:
+        lock = _tenant_locks.setdefault(tenant_id, threading.Lock())
+    with lock:  # one reload per tenant at a time; the rest wait for it
+        cached = _cache.get(tenant_id)
+        if _fresh(cached, min_version):
+            return cached
+        try:
+            loaded = from_ciap(tenant_id, ciap_api.get_catalog(tenant_id))
+        except ciap_api.CiapApiError as exc:
+            if cached is not None:
+                logger.warning("tenant=%s catalog reload failed, using version %s: %s", tenant_id, cached.version, exc)
+                return cached
+            raise CatalogUnavailable(f"Couldn't load tenant {tenant_id!r}'s catalog: {exc}") from exc
+        if cached is not None and loaded.version == cached.version:
+            # Unchanged (every change in CIP moves the version): keep the copy whose
+            # embedding index is already built, instead of re-embedding every phrase.
+            cached.loaded_at = loaded.loaded_at
+            return cached
+        _cache[tenant_id] = loaded
+        logger.info("tenant=%s catalog version %s loaded (%d intents)", tenant_id, loaded.version, len(loaded.intents))
+        return loaded
 
 
-# Labels are optional: an entry without one (including catalogs saved before
-# labels existed) is shown under its humanized name -- see views.intent_label.
-# An intent without a description is briefed to the model by its label alone,
-# and one without a remote binding is a mock.
-def _intent_spec(label, description, exemplars, required_slots, remote=None):
-    spec = {"exemplars": list(exemplars), "required_slots": list(required_slots)}
-    if label:
-        spec["label"] = label
-    if description:
-        spec["description"] = description
-    if remote:
-        spec["remote"] = remote
-    return spec
-
-
-def _save():
-    path = Path(config.CATALOG_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps({"intents": INTENTS}, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
-
-
-# -- validation ---------------------------------------------------------------
-
-
-def _check_slots(required_slots):
-    unknown = [s for s in required_slots if s not in SLOT_EXTRACTORS]
-    if unknown:
-        raise CatalogError(
-            422, "unknown_slot",
-            f"No extractor for slot(s) {unknown}; available: {sorted(SLOT_EXTRACTORS)}.",
-        )
-
-
-_CONNECTION_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-
-
-def _check_remote(remote, required_slots):
-    connection, remote_tool = remote.get("connection"), remote.get("tool")
-    if not isinstance(connection, str) or not _CONNECTION_NAME.match(connection):
-        raise CatalogError(422, "invalid_remote", "remote.connection must be a connection name like \"zoho\".")
-    if not isinstance(remote_tool, str) or not remote_tool.strip():
-        raise CatalogError(422, "invalid_remote", "remote.tool must be the tool's name on the MCP server.")
-    allowed = mcp_client.allowed_tools(connection)
-    if allowed is not None and remote_tool not in allowed:
-        raise CatalogError(
-            422, "invalid_remote",
-            f"remote.tool {remote_tool!r} isn't in connection {connection!r}'s allowed_tools ({allowed}).",
-        )
-    arguments = remote.get("arguments")
-    if arguments is not None and not isinstance(arguments, dict):
-        raise CatalogError(422, "invalid_remote", "remote.arguments must be an object.")
-    # The call's arguments are the intent's required slots, so a placeholder
-    # for any other slot would always render empty.
-    unknown = sorted(placeholders(arguments) - set(required_slots))
-    if unknown:
-        raise CatalogError(
-            422, "invalid_remote",
-            f"remote.arguments uses {unknown}, which this intent doesn't collect "
-            f"(its required_slots are {list(required_slots)}).",
-        )
-    fallback = remote.get("fallback")
-    if fallback is not None:
-        if not isinstance(fallback, dict):
-            raise CatalogError(422, "invalid_remote", "remote.fallback must be a binding object.")
-        _check_remote(fallback, required_slots)
-
-
-def _changed():
-    _save()
-    embeddings.invalidate_index()
-
-
-# -- intents ------------------------------------------------------------------
-
-
-KEEP = object()
-
-
-def put_intent(name, label, description, exemplars, required_slots, create, remote=KEEP):
-    """Create (create=True) or replace an intent. `remote` is its MCP binding
-    (None makes it a mock); an update that leaves it as KEEP keeps the
-    current one."""
-    with lock:
-        exists = name in INTENTS
-        if create and exists:
-            raise CatalogError(409, "intent_exists", f"Intent {name!r} already exists.")
-        if not create and not exists:
-            raise CatalogError(404, "intent_not_found", f"No intent named {name!r}.")
-        _check_slots(required_slots)
-        if remote is KEEP:
-            remote = INTENTS[name].get("remote") if exists else None
-        if remote is not None:
-            _check_remote(remote, required_slots)
-        INTENTS[name] = _intent_spec(label, description, exemplars, required_slots, remote)
-        _changed()
-
-
-def rename_intent(old, new):
-    """Move an intent to a new name. The caller moves live frames and their
-    tool calls over (server.py owns the calls)."""
-    with lock:
-        if old not in INTENTS:
-            raise CatalogError(404, "intent_not_found", f"No intent named {old!r}.")
-        if new in INTENTS:
-            raise CatalogError(409, "intent_exists", f"Intent {new!r} already exists.")
-        INTENTS[new] = INTENTS[old]
-        del INTENTS[old]
-        _changed()
-
-
-def delete_intent(name):
-    with lock:
-        if name not in INTENTS:
-            raise CatalogError(404, "intent_not_found", f"No intent named {name!r}.")
-        del INTENTS[name]
-        _changed()
+def clear_cache():
+    _cache.clear()

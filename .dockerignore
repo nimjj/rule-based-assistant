@@ -1,0 +1,13 @@
+.venv
+venv
+__pycache__
+**/__pycache__
+.pytest_cache
+.git
+.env
+*.env
+logs
+data
+tests
+scripts
+*.xlsx

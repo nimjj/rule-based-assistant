@@ -11,15 +11,21 @@
 # its required slots are still missing; later turns either fill those slots,
 # open a new frame (interruption), or revert a previous one (correction).
 
-from dataclasses import dataclass, field
+#
+# Intents and slots come from the catalog of the turn in progress
+# (catalog.current(): the tenant's own in CIP mode). The store holds no
+# reference to it, so it can be saved as plain JSON between turns
+# (to_dict / from_dict) and picked up by any instance for the next one.
 
+from dataclasses import asdict, dataclass, field, fields
+
+from ciap import catalog
 from ciap import config
 from ciap.pipeline import llm
 from ciap.pipeline import responder
+from ciap.pipeline import slots
 from ciap.integrations import mcp_tools
 from ciap.pipeline.embeddings import retrieve
-from ciap.pipeline.intents import INTENTS
-from ciap.pipeline.slots import SLOT_EXTRACTORS
 
 
 @dataclass
@@ -47,6 +53,21 @@ class ConversationStateStore:
         # How the turn in progress wants tool results explained (responder.MODES).
         self._answer_mode = config.RESPONDER_DEFAULT_MODE
 
+    # -- saving between turns ---------------------------------------------
+
+    def to_dict(self):
+        return {"frames": [asdict(f) for f in self.frames], "next_id": self._next_id}
+
+    @classmethod
+    def from_dict(cls, data):
+        store = cls()
+        if not data:
+            return store
+        known = {f.name for f in fields(Frame)}
+        store.frames = [Frame(**{k: v for k, v in f.items() if k in known}) for f in data.get("frames") or []]
+        store._next_id = data.get("next_id") or (max((f.id for f in store.frames), default=0) + 1)
+        return store
+
     # -- frame helpers --------------------------------------------------
 
     def _new_frame(self, intent, initiated_by="customer"):
@@ -61,8 +82,11 @@ class ConversationStateStore:
         frame.answer = responder.compose_answer(frame, self._answer_mode)
 
     def _pending_frame(self):
+        # A frame whose intent left the tenant's catalog mid-call can't be
+        # completed any more, so it doesn't hold later turns.
+        intents = catalog.intents()
         for frame in reversed(self.frames):
-            if frame.status == "AWAITING_INFO":
+            if frame.status == "AWAITING_INFO" and frame.intent in intents:
                 return frame
         return None
 
@@ -90,12 +114,15 @@ class ConversationStateStore:
         if frame.status == "REVERTED":
             raise ValueError(f"Frame #{frame_id} was reverted; nothing to override.")
 
-        required = INTENTS[frame.intent]["required_slots"]
+        spec = catalog.intents().get(frame.intent)
+        if spec is None:
+            raise ValueError(f"{frame.intent!r} is no longer in the catalog.")
+        required = spec["required_slots"]
         if slot_name not in required:
             raise ValueError(f"{slot_name!r} isn't a slot on {frame.intent}.")
 
-        extractor = SLOT_EXTRACTORS.get(slot_name)
-        value = extractor(raw_value) if extractor else raw_value
+        slot_spec = catalog.slot(slot_name)
+        value = slots.extract(slot_name, slot_spec, raw_value) if slots.has_pattern(slot_name, slot_spec) else raw_value
         if not value:
             raise ValueError(f"Couldn't read a valid {slot_name} from {raw_value!r}.")
 
@@ -113,15 +140,24 @@ class ConversationStateStore:
         return frame, refired
 
     def _fill_slots(self, frame, utterance, speaker="customer"):
-        required = INTENTS[frame.intent]["required_slots"]
+        spec = catalog.intents().get(frame.intent)
+        if spec is None:  # left the catalog mid-call: nothing to collect
+            return []
+        required = spec["required_slots"]
+        # The slot the agent asks for next: the only one a model reads when no
+        # pattern can (free-text slots), so a turn costs one call at most.
+        waiting_on = next((s for s in required if s not in frame.slots), None)
         filled_now = []
-        for slot_name in required:
+        for slot_name in required + spec.get("optional_slots", []):
             if slot_name in frame.slots:
                 continue
-            extractor = SLOT_EXTRACTORS.get(slot_name)
-            if not extractor:
-                continue
-            value = extractor(utterance)
+            slot_spec = catalog.slot(slot_name)
+            if slots.has_pattern(slot_name, slot_spec):
+                value = slots.extract(slot_name, slot_spec, utterance)
+            elif slot_name == waiting_on:
+                value = llm.extract_text_slot(utterance, slot_name, slot_spec)
+            else:
+                value = None
             if value:
                 frame.slots[slot_name] = value
                 filled_now.append(slot_name)
@@ -288,9 +324,9 @@ class ConversationStateStore:
             return self._open_new_intent(chosen_intent, utterance, speaker, trace, "new_intent_escalated")
 
         # Low confidence but looks like a correction/reference to something
-        # already in play -> revert the most recent frame.
-        if (correction_flag or reference_flag) and self.frames:
-            last = self._last_frame()
+        # already in play -> revert the most recent frame still in play.
+        last = next((f for f in reversed(self.frames) if f.status != "REVERTED"), None)
+        if (correction_flag or reference_flag) and last:
             llm_result = llm.escalate(
                 "correction_or_reference", utterance,
                 context={"last_frame": last.id, "intent": last.intent},
